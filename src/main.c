@@ -7,11 +7,14 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/time.h>
+#include <stdint.h>
 
 // Simple in-memory key-value store
 typedef struct Entry {
     char *key; size_t klen;
     char *val; size_t vlen;
+    int64_t expires_at_ms; // 0 means no expiry
     struct Entry *next;
 } Entry;
 
@@ -37,7 +40,37 @@ static Entry *kv_find(const char *key, size_t klen)
     return NULL;
 }
 
-static void kv_set(const char *key, size_t klen, const char *val, size_t vlen)
+static int64_t now_ms()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + (int64_t)(tv.tv_usec / 1000);
+}
+
+static void kv_delete_internal(unsigned long bucket, Entry *prev, Entry *e)
+{
+    if (prev) prev->next = e->next; else g_buckets[bucket] = e->next;
+    free(e->key);
+    free(e->val);
+    free(e);
+}
+
+static void kv_del(const char *key, size_t klen)
+{
+    unsigned long b = hash_bytes(key, klen) % NBUCKETS;
+    Entry *prev = NULL; Entry *cur = g_buckets[b];
+    while (cur)
+    {
+        if (cur->klen == klen && memcmp(cur->key, key, klen) == 0)
+        {
+            kv_delete_internal(b, prev, cur);
+            return;
+        }
+        prev = cur; cur = cur->next;
+    }
+}
+
+static void kv_set(const char *key, size_t klen, const char *val, size_t vlen, int64_t expires_at_ms)
 {
     unsigned long b = hash_bytes(key, klen) % NBUCKETS;
     Entry *e = g_buckets[b];
@@ -52,6 +85,7 @@ static void kv_set(const char *key, size_t klen, const char *val, size_t vlen)
             free(e->val);
             e->val = nval;
             e->vlen = vlen;
+            e->expires_at_ms = expires_at_ms;
             return;
         }
     }
@@ -69,6 +103,7 @@ static void kv_set(const char *key, size_t klen, const char *val, size_t vlen)
     memcpy(ne->val, val, vlen);
     ne->klen = klen;
     ne->vlen = vlen;
+    ne->expires_at_ms = expires_at_ms;
     ne->next = g_buckets[b];
     g_buckets[b] = ne;
 }
@@ -77,6 +112,16 @@ static int kv_get(const char *key, size_t klen, const char **out_val, size_t *ou
 {
     Entry *e = kv_find(key, klen);
     if (!e) return -1;
+    if (e->expires_at_ms > 0)
+    {
+        int64_t now = now_ms();
+        if (now >= e->expires_at_ms)
+        {
+            // Expired: delete and treat as missing
+            kv_del(key, klen);
+            return -1;
+        }
+    }
     *out_val = e->val;
     *out_vlen = e->vlen;
     return 0;
@@ -258,7 +303,7 @@ static int process_conn(int fd, Conn *c)
             offset += pos;
             continue;
         }
-        else if (arrlen == 3 && cmdlen == 3 && strncasecmp_local(cmd, "SET", 3) == 0)
+        else if (arrlen >= 3 && cmdlen == 3 && strncasecmp_local(cmd, "SET", 3) == 0)
         {
             // Parse key
             if (pos >= rem || p[pos] != '$') break;
@@ -286,12 +331,80 @@ static int process_conn(int fd, Conn *c)
             if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
             pos += 2;
 
+            // Optional options: EX <sec> | PX <ms>
+            int have_ttl = 0;
+            int64_t expires_at = 0;
+            long remaining = arrlen - 3; // options count
+            while (remaining >= 2)
+            {
+                if (pos >= rem || p[pos] != '$') break;
+                long onamelen = 0; size_t buo = 0; // option name length
+                if (parse_crlf_int(p + pos + 1, rem - pos - 1, &onamelen, &buo) != 0) break;
+                pos += 1 + buo;
+                if (onamelen < 0) { offset += pos; continue; }
+                if ((size_t)onamelen + 2 > rem - pos) break;
+                const char *oname = p + pos; size_t onamensz = (size_t)onamelen;
+                pos += onamensz;
+                if (pos + 2 > rem) break;
+                if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+                pos += 2;
+
+                if (pos >= rem || p[pos] != '$') break;
+                long oval_len = 0; size_t buv = 0;
+                if (parse_crlf_int(p + pos + 1, rem - pos - 1, &oval_len, &buv) != 0) break;
+                pos += 1 + buv;
+                if (oval_len < 0) { offset += pos; continue; }
+                if ((size_t)oval_len + 2 > rem - pos) break;
+                const char *oval = p + pos; size_t oval_sz = (size_t)oval_len;
+                pos += oval_sz;
+                if (pos + 2 > rem) break;
+                if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+                pos += 2;
+
+                // Parse numeric TTL
+                long ttl_num = 0;
+                // Convert oval bytes to integer
+                {
+                    long tmp = 0; int neg = 0; int any = 0;
+                    for (size_t i = 0; i < oval_sz; i++)
+                    {
+                        char ch = oval[i];
+                        if (i == 0 && ch == '-') { neg = 1; continue; }
+                        if (ch < '0' || ch > '9') { any = 0; break; }
+                        any = 1; tmp = tmp * 10 + (ch - '0');
+                    }
+                    if (!any || neg) { ttl_num = -1; }
+                    else ttl_num = tmp;
+                }
+
+                if (onamensz == 2 && strncasecmp_local(oname, "EX", 2) == 0)
+                {
+                    if (ttl_num <= 0) { const char err[] = "-ERR syntax error\r\n"; if (send_all(fd, err, sizeof(err)-1)!=0) return -1; offset += pos; continue; }
+                    expires_at = now_ms() + (int64_t)ttl_num * 1000;
+                    have_ttl = 1;
+                }
+                else if (onamensz == 2 && strncasecmp_local(oname, "PX", 2) == 0)
+                {
+                    if (ttl_num <= 0) { const char err[] = "-ERR syntax error\r\n"; if (send_all(fd, err, sizeof(err)-1)!=0) return -1; offset += pos; continue; }
+                    expires_at = now_ms() + (int64_t)ttl_num;
+                    have_ttl = 1;
+                }
+                else
+                {
+                    const char err[] = "-ERR syntax error\r\n";
+                    if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
+                    goto after_set_response; // break out to cleanup
+                }
+
+                remaining -= 2;
+            }
+
             // Store key/value
-            kv_set(kptr, ksz, vptr, vsz);
+            kv_set(kptr, ksz, vptr, vsz, have_ttl ? expires_at : 0);
 
             const char ok[] = "+OK\r\n";
             if (send_all(fd, ok, sizeof(ok) - 1) != 0) return -1;
-
+after_set_response:
             offset += pos;
             continue;
         }
