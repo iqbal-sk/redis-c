@@ -56,13 +56,32 @@ int main()
 		return 1;
 	}
 
-	printf("Waiting for a client to connect...\n");
-	client_addr_len = sizeof(client_addr);
+    printf("Waiting for a client to connect...\n");
+    client_addr_len = sizeof(client_addr);
 
-	accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-	printf("Client connected\n");
+    // Accept connections in a loop and respond with PONG
+    while (1)
+    {
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (client_fd == -1)
+        {
+            printf("Accept failed: %s\n", strerror(errno));
+            break;
+        }
 
-	close(server_fd);
+        printf("Client connected\n");
 
-	return 0;
+        const char *response = "+PONG\r\n";
+        ssize_t n = write(client_fd, response, strlen(response));
+        if (n == -1)
+        {
+            printf("Write failed: %s\n", strerror(errno));
+        }
+
+        close(client_fd);
+    }
+
+    close(server_fd);
+
+    return 0;
 }
