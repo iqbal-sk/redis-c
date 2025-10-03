@@ -59,9 +59,10 @@ int main()
     printf("Waiting for a client to connect...\n");
     client_addr_len = sizeof(client_addr);
 
-    // Accept connections in a loop and respond with PONG
+    // Accept connections in a loop and respond with PONG for each command
     while (1)
     {
+        client_addr_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
         if (client_fd == -1)
         {
@@ -72,10 +73,32 @@ int main()
         printf("Client connected\n");
 
         const char *response = "+PONG\r\n";
-        ssize_t n = write(client_fd, response, strlen(response));
-        if (n == -1)
+        char buf[4096];
+        while (1)
         {
-            printf("Write failed: %s\n", strerror(errno));
+            ssize_t r = read(client_fd, buf, sizeof(buf));
+            if (r > 0)
+            {
+                ssize_t w = write(client_fd, response, strlen(response));
+                if (w == -1)
+                {
+                    printf("Write failed: %s\n", strerror(errno));
+                    break;
+                }
+                // Continue reading for more commands on this connection
+                continue;
+            }
+            else if (r == 0)
+            {
+                // Client closed the connection
+                break;
+            }
+            else
+            {
+                // Read error
+                printf("Read failed: %s\n", strerror(errno));
+                break;
+            }
         }
 
         close(client_fd);
