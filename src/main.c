@@ -8,6 +8,80 @@
 #include <unistd.h>
 #include <sys/select.h>
 
+// Simple in-memory key-value store
+typedef struct Entry {
+    char *key; size_t klen;
+    char *val; size_t vlen;
+    struct Entry *next;
+} Entry;
+
+#define NBUCKETS 4096
+static Entry *g_buckets[NBUCKETS] = {0};
+
+static unsigned long hash_bytes(const char *s, size_t len)
+{
+    unsigned long h = 5381;
+    for (size_t i = 0; i < len; i++)
+        h = ((h << 5) + h) + (unsigned char)s[i]; // h*33 + c
+    return h;
+}
+
+static Entry *kv_find(const char *key, size_t klen)
+{
+    unsigned long h = hash_bytes(key, klen) % NBUCKETS;
+    for (Entry *e = g_buckets[h]; e; e = e->next)
+    {
+        if (e->klen == klen && memcmp(e->key, key, klen) == 0)
+            return e;
+    }
+    return NULL;
+}
+
+static void kv_set(const char *key, size_t klen, const char *val, size_t vlen)
+{
+    unsigned long b = hash_bytes(key, klen) % NBUCKETS;
+    Entry *e = g_buckets[b];
+    for (; e; e = e->next)
+    {
+        if (e->klen == klen && memcmp(e->key, key, klen) == 0)
+        {
+            // Replace existing value
+            char *nval = malloc(vlen);
+            if (!nval) return; // best effort
+            memcpy(nval, val, vlen);
+            free(e->val);
+            e->val = nval;
+            e->vlen = vlen;
+            return;
+        }
+    }
+    // New entry
+    Entry *ne = calloc(1, sizeof(Entry));
+    if (!ne) return;
+    ne->key = malloc(klen);
+    ne->val = malloc(vlen);
+    if (!ne->key || (!ne->val && vlen > 0))
+    {
+        free(ne->key); free(ne->val); free(ne);
+        return;
+    }
+    memcpy(ne->key, key, klen);
+    memcpy(ne->val, val, vlen);
+    ne->klen = klen;
+    ne->vlen = vlen;
+    ne->next = g_buckets[b];
+    g_buckets[b] = ne;
+}
+
+static int kv_get(const char *key, size_t klen, const char **out_val, size_t *out_vlen)
+{
+    Entry *e = kv_find(key, klen);
+    if (!e) return -1;
+    *out_val = e->val;
+    *out_vlen = e->vlen;
+    return 0;
+}
+
 // Simple per-connection buffer management for RESP parsing
 typedef struct
 {
@@ -88,6 +162,24 @@ static int strncasecmp_local(const char *a, const char *b, size_t n)
     return 0;
 }
 
+static int skip_bulk_items(const char *p, size_t rem, size_t *pos, long items)
+{
+    for (long i = 0; i < items; i++)
+    {
+        if (*pos >= rem || p[*pos] != '$') return -1;
+        long blen = 0; size_t bu = 0;
+        if (parse_crlf_int(p + *pos + 1, rem - *pos - 1, &blen, &bu) != 0) return -1;
+        *pos += 1 + bu;
+        if (blen >= 0)
+        {
+            if ((size_t)blen + 2 > rem - *pos) return -1;
+            *pos += (size_t)blen + 2;
+        }
+        // if blen == -1 (null), nothing more to skip for this bulk
+    }
+    return 0;
+}
+
 static int process_conn(int fd, Conn *c)
 {
     // Try to parse multiple RESP commands from the buffer
@@ -131,7 +223,7 @@ static int process_conn(int fd, Conn *c)
         if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
         pos += 2;
 
-        // Prepare for argument (if any). Only handle PING (no args) and ECHO (1 arg)
+        // Prepare for argument (if any). Handle PING, ECHO, SET, GET
         if (arrlen == 1 && cmdlen == 4 && strncasecmp_local(cmd, "PING", 4) == 0)
         {
             const char pong[] = "+PONG\r\n";
@@ -139,7 +231,7 @@ static int process_conn(int fd, Conn *c)
             offset += pos;
             continue;
         }
-        else if (arrlen >= 2 && cmdlen == 4 && strncasecmp_local(cmd, "ECHO", 4) == 0)
+        else if (arrlen == 2 && cmdlen == 4 && strncasecmp_local(cmd, "ECHO", 4) == 0)
         {
             // Parse the next bulk string as the message
             if (pos >= rem || p[pos] != '$') break;
@@ -166,11 +258,91 @@ static int process_conn(int fd, Conn *c)
             offset += pos;
             continue;
         }
+        else if (arrlen == 3 && cmdlen == 3 && strncasecmp_local(cmd, "SET", 3) == 0)
+        {
+            // Parse key
+            if (pos >= rem || p[pos] != '$') break;
+            long klen = 0; size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0) break;
+            pos += 1 + bu1;
+            if (klen < 0) { offset += pos; continue; }
+            if ((size_t)klen + 2 > rem - pos) break;
+            const char *kptr = p + pos; size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // Parse value
+            if (pos >= rem || p[pos] != '$') break;
+            long vlen = 0; size_t bu2 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &vlen, &bu2) != 0) break;
+            pos += 1 + bu2;
+            if (vlen < 0) { offset += pos; continue; }
+            if ((size_t)vlen + 2 > rem - pos) break;
+            const char *vptr = p + pos; size_t vsz = (size_t)vlen;
+            pos += vsz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // Store key/value
+            kv_set(kptr, ksz, vptr, vsz);
+
+            const char ok[] = "+OK\r\n";
+            if (send_all(fd, ok, sizeof(ok) - 1) != 0) return -1;
+
+            offset += pos;
+            continue;
+        }
+        else if (arrlen == 2 && cmdlen == 3 && strncasecmp_local(cmd, "GET", 3) == 0)
+        {
+            // Parse key
+            if (pos >= rem || p[pos] != '$') break;
+            long klen = 0; size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0) break;
+            pos += 1 + bu1;
+            if (klen < 0) { offset += pos; continue; }
+            if ((size_t)klen + 2 > rem - pos) break;
+            const char *kptr = p + pos; size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            const char *vptr = NULL; size_t vsz = 0;
+            if (kv_get(kptr, ksz, &vptr, &vsz) == 0)
+            {
+                char header[64];
+                int hl = snprintf(header, sizeof(header), "$%zu\r\n", vsz);
+                if (hl <= 0 || (size_t)hl >= sizeof(header)) return -1;
+                if (send_all(fd, header, (size_t)hl) != 0) return -1;
+                if (send_all(fd, vptr, vsz) != 0) return -1;
+                if (send_all(fd, "\r\n", 2) != 0) return -1;
+            }
+            else
+            {
+                const char nullbulk[] = "$-1\r\n";
+                if (send_all(fd, nullbulk, sizeof(nullbulk) - 1) != 0) return -1;
+            }
+            offset += pos;
+            continue;
+        }
         else
         {
             // Unknown or unsupported command; send simple error and consume
             const char err[] = "-ERR unknown command\r\n";
             if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
+            // Try to skip the rest of the array elements to resync
+            long to_skip = arrlen - 1;
+            if (to_skip > 0)
+            {
+                if (skip_bulk_items(p, rem, &pos, to_skip) != 0)
+                {
+                    // Incomplete, wait for more data
+                    break;
+                }
+            }
             offset += pos;
             continue;
         }
