@@ -6,6 +6,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/select.h>
 
 int main()
 {
@@ -56,52 +57,81 @@ int main()
 		return 1;
 	}
 
-    printf("Waiting for a client to connect...\n");
-    client_addr_len = sizeof(client_addr);
+    printf("Waiting for clients...\n");
 
-    // Accept connections in a loop and respond with PONG for each command
+    // Use select()-based event loop to handle multiple clients
+    fd_set master_set, read_fds;
+    FD_ZERO(&master_set);
+    FD_SET(server_fd, &master_set);
+    int fdmax = server_fd;
+
+    const char *response = "+PONG\r\n";
+
     while (1)
     {
-        client_addr_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_fd == -1)
+        read_fds = master_set; // copy
+        int activity = select(fdmax + 1, &read_fds, NULL, NULL, NULL);
+        if (activity < 0)
         {
-            printf("Accept failed: %s\n", strerror(errno));
+            if (errno == EINTR)
+                continue;
+            printf("select() failed: %s\n", strerror(errno));
             break;
         }
 
-        printf("Client connected\n");
-
-        const char *response = "+PONG\r\n";
-        char buf[4096];
-        while (1)
+        for (int fd = 0; fd <= fdmax; fd++)
         {
-            ssize_t r = read(client_fd, buf, sizeof(buf));
-            if (r > 0)
-            {
-                ssize_t w = write(client_fd, response, strlen(response));
-                if (w == -1)
-                {
-                    printf("Write failed: %s\n", strerror(errno));
-                    break;
-                }
-                // Continue reading for more commands on this connection
+            if (!FD_ISSET(fd, &read_fds))
                 continue;
-            }
-            else if (r == 0)
+
+            if (fd == server_fd)
             {
-                // Client closed the connection
-                break;
+                // New client connection
+                client_addr_len = sizeof(client_addr);
+                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+                if (client_fd == -1)
+                {
+                    printf("Accept failed: %s\n", strerror(errno));
+                    continue;
+                }
+                FD_SET(client_fd, &master_set);
+                if (client_fd > fdmax)
+                    fdmax = client_fd;
+                printf("Client connected (fd=%d)\n", client_fd);
             }
             else
             {
-                // Read error
-                printf("Read failed: %s\n", strerror(errno));
-                break;
+                // Data from existing client
+                char buf[4096];
+                ssize_t r = read(fd, buf, sizeof(buf));
+                if (r > 0)
+                {
+                    // Respond with PONG for any received data
+                    ssize_t w = write(fd, response, strlen(response));
+                    if (w == -1)
+                    {
+                        printf("Write failed (fd=%d): %s\n", fd, strerror(errno));
+                        // Close on write failure
+                        close(fd);
+                        FD_CLR(fd, &master_set);
+                    }
+                }
+                else if (r == 0)
+                {
+                    // Client closed
+                    printf("Client disconnected (fd=%d)\n", fd);
+                    close(fd);
+                    FD_CLR(fd, &master_set);
+                }
+                else
+                {
+                    // Read error
+                    printf("Read failed (fd=%d): %s\n", fd, strerror(errno));
+                    close(fd);
+                    FD_CLR(fd, &master_set);
+                }
             }
         }
-
-        close(client_fd);
     }
 
     close(server_fd);
