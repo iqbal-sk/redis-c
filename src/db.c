@@ -467,6 +467,52 @@ int db_list_range_emit(DB *db, const char *key, size_t klen, long start, long st
     return 0;
 }
 
+int db_list_lpop(DB *db, const char *key, size_t klen, char **out_val, size_t *out_vlen, int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    if (out_val) *out_val = NULL;
+    if (out_vlen) *out_vlen = 0;
+
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e)
+        return 1; // not found
+    if (e->type != OBJ_LIST)
+    {
+        if (wrongtype) *wrongtype = 1;
+        return -1;
+    }
+
+    ListNode *head = e->data.list.head;
+    if (!head)
+        return 1; // empty list
+
+    // Detach head
+    e->data.list.head = head->next;
+    if (e->data.list.head) e->data.list.head->prev = NULL; else e->data.list.tail = NULL;
+    e->data.list.len--;
+
+    // Take ownership of value buffer; free node
+    char *val = head->val;
+    size_t vlen = head->vlen;
+    free(head);
+
+    // Optionally delete key if list becomes empty (not required, but tidy)
+    if (e->data.list.len == 0)
+    {
+        // Re-find prev may be stale if we modified structure minimally, but key position unchanged
+        // Use stored b and prev gathered earlier to delete e safely
+        if (prev) prev->next = e->next; else db->buckets[b] = e->next;
+        free(e->key);
+        // list is already empty
+        free(e); // no string to free
+    }
+
+    if (out_val) *out_val = val;
+    if (out_vlen) *out_vlen = vlen;
+    return 0;
+}
+
 int db_list_length(DB *db, const char *key, size_t klen, size_t *out_len, int *wrongtype)
 {
     if (wrongtype)
