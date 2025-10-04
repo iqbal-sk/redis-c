@@ -188,7 +188,7 @@ int process_conn(int fd, Conn *c, DB *db)
             if (send_all(fd, ok, sizeof(ok) - 1) != 0) return -1;
             offset += pos; continue;
         }
-        else if (arrlen == 3 && cmdlen == 5 && ascii_casecmp_n(cmd, "RPUSH", 5) == 0)
+        else if (arrlen >= 3 && cmdlen == 5 && ascii_casecmp_n(cmd, "RPUSH", 5) == 0)
         {
             // key
             if (pos >= rem || p[pos] != '$') break;
@@ -203,33 +203,36 @@ int process_conn(int fd, Conn *c, DB *db)
             if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
             pos += 2;
 
-            // element
-            if (pos >= rem || p[pos] != '$') break;
-            long elen = 0; size_t bu2 = 0;
-            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &elen, &bu2) != 0) break;
-            pos += 1 + bu2;
-            if (elen < 0) { offset += pos; continue; }
-            if ((size_t)elen + 2 > rem - pos) break;
-            const char *eptr = p + pos; size_t esz = (size_t)elen;
-            pos += esz;
-            if (pos + 2 > rem) break;
-            if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
-            pos += 2;
-
+            // one or more elements
             size_t newlen = 0; int wrongtype = 0;
-            if (db_list_rpush(db, kptr, ksz, eptr, esz, &newlen, &wrongtype) != 0)
+            long remaining = arrlen - 2;
+            for (long i = 0; i < remaining; i++)
             {
+                if (pos >= rem || p[pos] != '$') { wrongtype = 0; break; }
+                long elen = 0; size_t bu2 = 0;
+                if (parse_crlf_int(p + pos + 1, rem - pos - 1, &elen, &bu2) != 0) { wrongtype = 0; break; }
+                pos += 1 + bu2;
+                if (elen < 0) { offset += pos; continue; }
+                if ((size_t)elen + 2 > rem - pos) { wrongtype = 0; break; }
+                const char *eptr = p + pos; size_t esz = (size_t)elen;
+                pos += esz;
+                if (pos + 2 > rem) { wrongtype = 0; break; }
+                if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+                pos += 2;
+
+                if (db_list_rpush(db, kptr, ksz, eptr, esz, &newlen, &wrongtype) != 0)
+                {
+                    // failure (e.g., alloc). We'll send generic error.
+                    const char err[] = "-ERR rpush failed\r\n";
+                    if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
+                    offset += pos; break;
+                }
                 if (wrongtype)
                 {
                     const char wt[] = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
                     if (send_all(fd, wt, sizeof(wt) - 1) != 0) return -1;
+                    offset += pos; break;
                 }
-                else
-                {
-                    const char err[] = "-ERR rpush failed\r\n";
-                    if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
-                }
-                offset += pos; continue;
             }
 
             char ibuf[64];
