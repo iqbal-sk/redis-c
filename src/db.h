@@ -1,9 +1,25 @@
 #pragma once
 #include "common.h"
 
+typedef enum { OBJ_STRING = 0, OBJ_LIST = 1 } ObjType;
+
+typedef struct ListNode {
+    struct ListNode *prev, *next;
+    char *val; size_t vlen;
+} ListNode;
+
+typedef struct List {
+    ListNode *head, *tail;
+    size_t len;
+} List;
+
 typedef struct Entry {
     char *key; size_t klen;
-    char *val; size_t vlen;
+    ObjType type;
+    union {
+        struct { char *ptr; size_t len; } str;
+        List list;
+    } data;
     int64_t expires_at_ms; // 0 => no expiry
     struct Entry *next;
 } Entry;
@@ -22,3 +38,5 @@ void db_del(DB *db, const char *key, size_t klen);
 
 int64_t now_ms(void);
 
+// Lists
+int db_list_rpush(DB *db, const char *key, size_t klen, const char *elem, size_t elen, size_t *out_len, int *wrongtype);

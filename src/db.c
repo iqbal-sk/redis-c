@@ -16,6 +16,20 @@ int db_init(DB *db, size_t nbuckets)
     return db->buckets ? 0 : -1;
 }
 
+static void list_free(List *lst)
+{
+    ListNode *n = lst->head;
+    while (n)
+    {
+        ListNode *nx = n->next;
+        free(n->val);
+        free(n);
+        n = nx;
+    }
+    lst->head = lst->tail = NULL;
+    lst->len = 0;
+}
+
 void db_free(DB *db)
 {
     if (!db || !db->buckets) return;
@@ -26,7 +40,14 @@ void db_free(DB *db)
         {
             Entry *n = e->next;
             free(e->key);
-            free(e->val);
+            if (e->type == OBJ_STRING)
+            {
+                free(e->data.str.ptr);
+            }
+            else if (e->type == OBJ_LIST)
+            {
+                list_free(&e->data.list);
+            }
             free(e);
             e = n;
         }
@@ -68,7 +89,8 @@ void db_del(DB *db, const char *key, size_t klen)
     if (!e) return;
     if (prev) prev->next = e->next; else db->buckets[b] = e->next;
     free(e->key);
-    free(e->val);
+    if (e->type == OBJ_STRING) free(e->data.str.ptr);
+    else if (e->type == OBJ_LIST) list_free(&e->data.list);
     free(e);
 }
 
@@ -81,9 +103,17 @@ void db_set(DB *db, const char *key, size_t klen, const char *val, size_t vlen, 
         char *nval = malloc(vlen);
         if (!nval) return;
         memcpy(nval, val, vlen);
-        free(e->val);
-        e->val = nval;
-        e->vlen = vlen;
+        if (e->type == OBJ_STRING)
+        {
+            free(e->data.str.ptr);
+        }
+        else if (e->type == OBJ_LIST)
+        {
+            list_free(&e->data.list);
+        }
+        e->type = OBJ_STRING;
+        e->data.str.ptr = nval;
+        e->data.str.len = vlen;
         e->expires_at_ms = expires_at_ms;
         return;
     }
@@ -91,16 +121,17 @@ void db_set(DB *db, const char *key, size_t klen, const char *val, size_t vlen, 
     Entry *ne = (Entry *)calloc(1, sizeof(Entry));
     if (!ne) return;
     ne->key = (char *)malloc(klen);
-    ne->val = (char *)malloc(vlen);
-    if (!ne->key || (!ne->val && vlen > 0))
+    ne->data.str.ptr = (char *)malloc(vlen);
+    if (!ne->key || (!ne->data.str.ptr && vlen > 0))
     {
-        free(ne->key); free(ne->val); free(ne);
+        free(ne->key); free(ne->data.str.ptr); free(ne);
         return;
     }
     memcpy(ne->key, key, klen);
-    memcpy(ne->val, val, vlen);
+    memcpy(ne->data.str.ptr, val, vlen);
     ne->klen = klen;
-    ne->vlen = vlen;
+    ne->type = OBJ_STRING;
+    ne->data.str.len = vlen;
     ne->expires_at_ms = expires_at_ms;
     ne->next = db->buckets[b];
     db->buckets[b] = ne;
@@ -115,10 +146,71 @@ int db_get(DB *db, const char *key, size_t klen, const char **out_val, size_t *o
     {
         // Expired: delete eagerly
         if (prev) prev->next = e->next; else db->buckets[b] = e->next;
-        free(e->key); free(e->val); free(e);
+        free(e->key);
+        if (e->type == OBJ_STRING) free(e->data.str.ptr);
+        else if (e->type == OBJ_LIST) list_free(&e->data.list);
+        free(e);
         return -1;
     }
-    *out_val = e->val;
-    *out_vlen = e->vlen;
+    if (e->type != OBJ_STRING) return -1; // wrong type for GET (treat as missing for now)
+    *out_val = e->data.str.ptr;
+    *out_vlen = e->data.str.len;
+    return 0;
+}
+
+int db_list_rpush(DB *db, const char *key, size_t klen, const char *elem, size_t elen, size_t *out_len, int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e)
+    {
+        // Create new list and add one element
+        Entry *ne = (Entry *)calloc(1, sizeof(Entry));
+        if (!ne) return -1;
+        ne->key = (char *)malloc(klen);
+        if (!ne->key) { free(ne); return -1; }
+        memcpy(ne->key, key, klen);
+        ne->klen = klen;
+        ne->type = OBJ_LIST;
+        ne->expires_at_ms = 0;
+        ne->data.list.head = ne->data.list.tail = NULL;
+        ne->data.list.len = 0;
+
+        ListNode *node = (ListNode *)calloc(1, sizeof(ListNode));
+        if (!node) { free(ne->key); free(ne); return -1; }
+        node->val = (char *)malloc(elen);
+        if (!node->val && elen > 0) { free(node); free(ne->key); free(ne); return -1; }
+        if (elen > 0) memcpy(node->val, elem, elen);
+        node->vlen = elen;
+        node->prev = ne->data.list.tail;
+        node->next = NULL;
+        ne->data.list.head = ne->data.list.tail = node;
+        ne->data.list.len = 1;
+
+        ne->next = db->buckets[b];
+        db->buckets[b] = ne;
+        if (out_len) *out_len = 1;
+        return 0;
+    }
+    // Existing key
+    if (e->type != OBJ_LIST)
+    {
+        if (wrongtype) *wrongtype = 1;
+        return -1;
+    }
+    // Append one element to list
+    ListNode *node = (ListNode *)calloc(1, sizeof(ListNode));
+    if (!node) return -1;
+    node->val = (char *)malloc(elen);
+    if (!node->val && elen > 0) { free(node); return -1; }
+    if (elen > 0) memcpy(node->val, elem, elen);
+    node->vlen = elen;
+    node->prev = e->data.list.tail;
+    node->next = NULL;
+    if (e->data.list.tail) e->data.list.tail->next = node; else e->data.list.head = node;
+    e->data.list.tail = node;
+    e->data.list.len++;
+    if (out_len) *out_len = e->data.list.len;
     return 0;
 }
