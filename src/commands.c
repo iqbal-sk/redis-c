@@ -606,6 +606,94 @@ int process_conn(int fd, Conn *c, DB *db)
             offset += pos;
             continue;
         }
+        else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "LPOP", 4) == 0)
+        {
+            // key
+            if (pos >= rem || p[pos] != '$')
+                break;
+            long klen = 0;
+            size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
+                break;
+            pos += 1 + bu1;
+            if (klen < 0)
+            {
+                offset += pos;
+                continue;
+            }
+            if ((size_t)klen + 2 > rem - pos)
+                break;
+            const char *kptr = p + pos;
+            size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem)
+                break;
+            if (p[pos] != '\r' || p[pos + 1] != '\n')
+            {
+                offset += pos + 2;
+                continue;
+            }
+            pos += 2;
+
+            int wrongtype = 0;
+            char *v = NULL;
+            size_t vlen = 0;
+            int rc = db_list_lpop(db, kptr, ksz, &v, &vlen, &wrongtype);
+            if (rc < 0 && wrongtype)
+            {
+                const char wt[] = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+                if (send_all(fd, wt, sizeof(wt) - 1) != 0)
+                {
+                    if (v)
+                        free(v);
+                    return -1;
+                }
+                offset += pos;
+                if (v)
+                    free(v);
+                continue;
+            }
+            if (rc != 0 || v == NULL)
+            {
+                const char nullbulk[] = "$-1\r\n";
+                if (send_all(fd, nullbulk, sizeof(nullbulk) - 1) != 0)
+                {
+                    if (v)
+                        free(v);
+                    return -1;
+                }
+                offset += pos;
+                if (v)
+                    free(v);
+                continue;
+            }
+
+            char header[64];
+            int hl = snprintf(header, sizeof(header), "$%zu\r\n", vlen);
+            if (hl <= 0 || (size_t)hl >= sizeof(header))
+            {
+                free(v);
+                return -1;
+            }
+            if (send_all(fd, header, (size_t)hl) != 0)
+            {
+                free(v);
+                return -1;
+            }
+            if (send_all(fd, v, vlen) != 0)
+            {
+                free(v);
+                return -1;
+            }
+            if (send_all(fd, "\r\n", 2) != 0)
+            {
+                free(v);
+                return -1;
+            }
+            free(v);
+            offset += pos;
+            continue;
+        }
         else if (arrlen == 4 && cmdlen == 6 && ascii_casecmp_n(cmd, "LRANGE", 6) == 0)
         {
             // key
