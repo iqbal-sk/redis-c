@@ -606,6 +606,93 @@ int process_conn(int fd, Conn *c, DB *db)
             offset += pos;
             continue;
         }
+        else if (arrlen == 3 && cmdlen == 4 && ascii_casecmp_n(cmd, "LPOP", 4) == 0)
+        {
+            // key
+            if (pos >= rem || p[pos] != '$')
+                break;
+            long klen = 0; size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
+                break;
+            pos += 1 + bu1;
+            if (klen < 0) { offset += pos; continue; }
+            if ((size_t)klen + 2 > rem - pos) break;
+            const char *kptr = p + pos; size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // count as bulk
+            if (pos >= rem || p[pos] != '$') break;
+            long clen = 0; size_t buc = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &clen, &buc) != 0) break;
+            pos += 1 + buc;
+            if (clen < 0) { offset += pos; continue; }
+            if ((size_t)clen + 2 > rem - pos) break;
+            const char *cptr = p + pos; size_t csz = (size_t)clen;
+            pos += csz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // parse positive count
+            long cnt = 0; int ok = 1; int any = 0; long tmp = 0; int neg = 0;
+            for (size_t i = 0; i < csz; i++)
+            {
+                char ch = cptr[i];
+                if (i == 0 && ch == '-') { neg = 1; continue; }
+                if (ch < '0' || ch > '9') { ok = 0; break; }
+                any = 1; tmp = tmp * 10 + (ch - '0');
+            }
+            if (!any) ok = 0; cnt = neg ? -tmp : tmp;
+            if (!ok || cnt <= 0)
+            {
+                const char err[] = "-ERR value is not an integer or out of range\r\n";
+                if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
+                offset += pos; continue;
+            }
+
+            // pop up to cnt elements
+            size_t cap = (size_t)cnt;
+            char **vals = (char **)calloc(cap, sizeof(char*));
+            size_t *vls = (size_t *)calloc(cap, sizeof(size_t));
+            if (!vals || !vls) { free(vals); free(vls); return -1; }
+
+            size_t popped = 0; int wrongtype = 0;
+            for (long i = 0; i < cnt; i++)
+            {
+                char *v = NULL; size_t vlen = 0; int rc = db_list_lpop(db, kptr, ksz, &v, &vlen, &wrongtype);
+                if (rc < 0 && wrongtype)
+                {
+                    const char wt[] = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+                    if (send_all(fd, wt, sizeof(wt) - 1) != 0) { free(vals); free(vls); return -1; }
+                    // free collected values
+                    for (size_t j = 0; j < popped; j++) free(vals[j]);
+                    free(vals); free(vls);
+                    offset += pos; wrongtype = 1; break;
+                }
+                if (rc != 0 || !v)
+                {
+                    break; // no more elements
+                }
+                vals[popped] = v; vls[popped] = vlen; popped++;
+            }
+            if (wrongtype)
+                continue;
+
+            // write array response
+            char h[64]; int hl = snprintf(h, sizeof(h), "*%zu\r\n", popped);
+            if (hl <= 0 || (size_t)hl >= sizeof(h)) { for (size_t j=0;j<popped;j++) free(vals[j]); free(vals); free(vls); return -1; }
+            if (send_all(fd, h, (size_t)hl) != 0) { for (size_t j=0;j<popped;j++) free(vals[j]); free(vals); free(vls); return -1; }
+            for (size_t i = 0; i < popped; i++)
+            {
+                if (emit_bulk_write(&fd, vals[i], vls[i]) != 0) { for (size_t j=0;j<popped;j++) free(vals[j]); free(vals); free(vls); return -1; }
+            }
+            for (size_t j = 0; j < popped; j++) free(vals[j]);
+            free(vals); free(vls);
+            offset += pos; continue;
+        }
         else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "LPOP", 4) == 0)
         {
             // key
