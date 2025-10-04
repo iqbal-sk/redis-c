@@ -215,6 +215,63 @@ int db_list_rpush(DB *db, const char *key, size_t klen, const char *elem, size_t
     return 0;
 }
 
+int db_list_lpush(DB *db, const char *key, size_t klen, const char *elem, size_t elen, size_t *out_len, int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e)
+    {
+        // Create new list and add one element at head
+        Entry *ne = (Entry *)calloc(1, sizeof(Entry));
+        if (!ne) return -1;
+        ne->key = (char *)malloc(klen);
+        if (!ne->key) { free(ne); return -1; }
+        memcpy(ne->key, key, klen);
+        ne->klen = klen;
+        ne->type = OBJ_LIST;
+        ne->expires_at_ms = 0;
+        ne->data.list.head = ne->data.list.tail = NULL;
+        ne->data.list.len = 0;
+
+        ListNode *node = (ListNode *)calloc(1, sizeof(ListNode));
+        if (!node) { free(ne->key); free(ne); return -1; }
+        node->val = (char *)malloc(elen);
+        if (!node->val && elen > 0) { free(node); free(ne->key); free(ne); return -1; }
+        if (elen > 0) memcpy(node->val, elem, elen);
+        node->vlen = elen;
+        node->prev = NULL;
+        node->next = ne->data.list.head;
+        ne->data.list.head = ne->data.list.tail = node;
+        ne->data.list.len = 1;
+
+        ne->next = db->buckets[b];
+        db->buckets[b] = ne;
+        if (out_len) *out_len = 1;
+        return 0;
+    }
+    // Existing key
+    if (e->type != OBJ_LIST)
+    {
+        if (wrongtype) *wrongtype = 1;
+        return -1;
+    }
+    // Prepend one element to list
+    ListNode *node = (ListNode *)calloc(1, sizeof(ListNode));
+    if (!node) return -1;
+    node->val = (char *)malloc(elen);
+    if (!node->val && elen > 0) { free(node); return -1; }
+    if (elen > 0) memcpy(node->val, elem, elen);
+    node->vlen = elen;
+    node->prev = NULL;
+    node->next = e->data.list.head;
+    if (e->data.list.head) e->data.list.head->prev = node; else e->data.list.tail = node;
+    e->data.list.head = node;
+    e->data.list.len++;
+    if (out_len) *out_len = e->data.list.len;
+    return 0;
+}
+
 static size_t list_len(const List *lst)
 {
     return lst->len;
