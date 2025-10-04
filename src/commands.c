@@ -1,5 +1,17 @@
 #include "commands.h"
 
+static int emit_bulk_write(void *ctx, const char *val, size_t vlen)
+{
+    int fd_local = *(int *)ctx;
+    char h[64];
+    int l = snprintf(h, sizeof(h), "$%zu\r\n", vlen);
+    if (l <= 0 || (size_t)l >= sizeof(h)) return -1;
+    if (send_all(fd_local, h, (size_t)l) != 0) return -1;
+    if (send_all(fd_local, val, vlen) != 0) return -1;
+    if (send_all(fd_local, "\r\n", 2) != 0) return -1;
+    return 0;
+}
+
 int ensure_capacity(Conn *c, size_t need)
 {
     if (c->cap >= need)
@@ -204,7 +216,7 @@ int process_conn(int fd, Conn *c, DB *db)
             pos += 2;
 
             // one or more elements
-            size_t newlen = 0; int wrongtype = 0;
+            size_t newlen = 0; int wrongtype = 0; int had_error = 0;
             long remaining = arrlen - 2;
             for (long i = 0; i < remaining; i++)
             {
@@ -225,20 +237,133 @@ int process_conn(int fd, Conn *c, DB *db)
                     // failure (e.g., alloc). We'll send generic error.
                     const char err[] = "-ERR rpush failed\r\n";
                     if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
-                    offset += pos; break;
+                    offset += pos; had_error = 1; break;
                 }
                 if (wrongtype)
                 {
                     const char wt[] = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
                     if (send_all(fd, wt, sizeof(wt) - 1) != 0) return -1;
-                    offset += pos; break;
+                    offset += pos; had_error = 1; break;
                 }
             }
-
+            if (had_error) { continue; }
             char ibuf[64];
             int il = snprintf(ibuf, sizeof(ibuf), ":%zu\r\n", newlen);
             if (il <= 0 || (size_t)il >= sizeof(ibuf)) return -1;
             if (send_all(fd, ibuf, (size_t)il) != 0) return -1;
+            offset += pos; continue;
+        }
+        else if (arrlen == 4 && cmdlen == 6 && ascii_casecmp_n(cmd, "LRANGE", 6) == 0)
+        {
+            // key
+            if (pos >= rem || p[pos] != '$') break;
+            long klen = 0; size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0) break;
+            pos += 1 + bu1;
+            if (klen < 0) { offset += pos; continue; }
+            if ((size_t)klen + 2 > rem - pos) break;
+            const char *kptr = p + pos; size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // start index as bulk
+            if (pos >= rem || p[pos] != '$') break;
+            long slen = 0; size_t bus = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &slen, &bus) != 0) break;
+            pos += 1 + bus;
+            if (slen < 0) { offset += pos; continue; }
+            if ((size_t)slen + 2 > rem - pos) break;
+            const char *sptr = p + pos; size_t ssz = (size_t)slen;
+            pos += ssz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // stop index as bulk
+            if (pos >= rem || p[pos] != '$') break;
+            long tlen = 0; size_t but = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &tlen, &but) != 0) break;
+            pos += 1 + but;
+            if (tlen < 0) { offset += pos; continue; }
+            if ((size_t)tlen + 2 > rem - pos) break;
+            const char *tptr = p + pos; size_t tsz = (size_t)tlen;
+            pos += tsz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // parse start/stop numbers
+            long start = 0, stop = 0;
+            int ok = 1; int any = 0; long tmp = 0; int neg = 0;
+            // start
+            tmp = 0; neg = 0; any = 0;
+            for (size_t i = 0; i < ssz; i++)
+            {
+                char ch = sptr[i];
+                if (i == 0 && ch == '-') { neg = 1; continue; }
+                if (ch < '0' || ch > '9') { ok = 0; break; }
+                any = 1; tmp = tmp * 10 + (ch - '0');
+            }
+            if (!any) ok = 0; start = neg ? -tmp : tmp;
+            // stop
+            tmp = 0; neg = 0; any = 0;
+            for (size_t i = 0; i < tsz; i++)
+            {
+                char ch = tptr[i];
+                if (i == 0 && ch == '-') { neg = 1; continue; }
+                if (ch < '0' || ch > '9') { ok = 0; break; }
+                any = 1; tmp = tmp * 10 + (ch - '0');
+            }
+            if (!any) ok = 0; stop = neg ? -tmp : tmp;
+
+            if (!ok)
+            {
+                const char err[] = "-ERR value is not an integer or out of range\r\n";
+                if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
+                offset += pos; continue;
+            }
+
+            // For this stage, handle only non-negative indices; if negative, return empty array
+            if (start < 0 || stop < 0)
+            {
+                const char empty[] = "*0\r\n";
+                if (send_all(fd, empty, sizeof(empty) - 1) != 0) return -1;
+                offset += pos; continue;
+            }
+
+            size_t cnt = 0; int wrongtype = 0;
+            if (db_list_range_count(db, kptr, ksz, start, stop, &cnt, &wrongtype) != 0)
+            {
+                if (wrongtype)
+                {
+                    const char wt[] = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+                    if (send_all(fd, wt, sizeof(wt) - 1) != 0) return -1;
+                }
+                else
+                {
+                    const char empty[] = "*0\r\n";
+                    if (send_all(fd, empty, sizeof(empty) - 1) != 0) return -1;
+                }
+                offset += pos; continue;
+            }
+
+            char header[64];
+            int hl = snprintf(header, sizeof(header), "*%zu\r\n", cnt);
+            if (hl <= 0 || (size_t)hl >= sizeof(header)) return -1;
+            if (send_all(fd, header, (size_t)hl) != 0) return -1;
+
+            int fd_ctx = fd;
+            wrongtype = 0;
+            if (cnt > 0)
+            {
+                if (db_list_range_emit(db, kptr, ksz, start, stop, emit_bulk_write, &fd_ctx, &wrongtype) != 0)
+                {
+                    // if fails mid-way, close connection by returning error
+                    return -1;
+                }
+            }
             offset += pos; continue;
         }
         else if (arrlen == 2 && cmdlen == 3 && ascii_casecmp_n(cmd, "GET", 3) == 0)

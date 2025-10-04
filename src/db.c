@@ -214,3 +214,55 @@ int db_list_rpush(DB *db, const char *key, size_t klen, const char *elem, size_t
     if (out_len) *out_len = e->data.list.len;
     return 0;
 }
+
+static size_t list_len(const List *lst)
+{
+    return lst->len;
+}
+
+int db_list_range_count(DB *db, const char *key, size_t klen, long start, long stop, size_t *out_n, int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    if (out_n) *out_n = 0;
+    if (start < 0 || stop < 0) { if (out_n) *out_n = 0; return 0; }
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e) { if (out_n) *out_n = 0; return 0; }
+    if (e->type != OBJ_LIST) { if (wrongtype) *wrongtype = 1; return -1; }
+    size_t len = list_len(&e->data.list);
+    if ((size_t)start >= len) { if (out_n) *out_n = 0; return 0; }
+    size_t s = (size_t)start;
+    size_t t = (size_t)stop;
+    if (t >= len) t = len - 1;
+    if (s > t) { if (out_n) *out_n = 0; return 0; }
+    if (out_n) *out_n = (t - s + 1);
+    return 0;
+}
+
+int db_list_range_emit(DB *db, const char *key, size_t klen, long start, long stop, db_emit_cb emit, void *ctx, int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    if (!emit) return 0;
+    if (start < 0 || stop < 0) return 0;
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e) return 0;
+    if (e->type != OBJ_LIST) { if (wrongtype) *wrongtype = 1; return -1; }
+    size_t len = e->data.list.len;
+    if ((size_t)start >= len) return 0;
+    size_t s = (size_t)start;
+    size_t t = (size_t)stop;
+    if (t >= len) t = len - 1;
+    if (s > t) return 0;
+
+    // Walk to start index
+    ListNode *n = e->data.list.head;
+    size_t idx = 0;
+    while (n && idx < s) { n = n->next; idx++; }
+    while (n && idx <= t)
+    {
+        if (emit(ctx, n->val, n->vlen) != 0) return -1;
+        n = n->next; idx++;
+    }
+    return 0;
+}

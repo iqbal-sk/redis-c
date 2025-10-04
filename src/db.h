@@ -40,3 +40,6 @@ int64_t now_ms(void);
 
 // Lists
 int db_list_rpush(DB *db, const char *key, size_t klen, const char *elem, size_t elen, size_t *out_len, int *wrongtype);
+int db_list_range_count(DB *db, const char *key, size_t klen, long start, long stop, size_t *out_n, int *wrongtype);
+typedef int (*db_emit_cb)(void *ctx, const char *val, size_t vlen);
+int db_list_range_emit(DB *db, const char *key, size_t klen, long start, long stop, db_emit_cb emit, void *ctx, int *wrongtype);
