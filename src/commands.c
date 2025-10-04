@@ -325,14 +325,6 @@ int process_conn(int fd, Conn *c, DB *db)
                 offset += pos; continue;
             }
 
-            // For this stage, handle only non-negative indices; if negative, return empty array
-            if (start < 0 || stop < 0)
-            {
-                const char empty[] = "*0\r\n";
-                if (send_all(fd, empty, sizeof(empty) - 1) != 0) return -1;
-                offset += pos; continue;
-            }
-
             size_t cnt = 0; int wrongtype = 0;
             if (db_list_range_count(db, kptr, ksz, start, stop, &cnt, &wrongtype) != 0)
             {
