@@ -253,6 +253,58 @@ int process_conn(int fd, Conn *c, DB *db)
             if (send_all(fd, ibuf, (size_t)il) != 0) return -1;
             offset += pos; continue;
         }
+        else if (arrlen >= 3 && cmdlen == 5 && ascii_casecmp_n(cmd, "LPUSH", 5) == 0)
+        {
+            // key
+            if (pos >= rem || p[pos] != '$') break;
+            long klen = 0; size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0) break;
+            pos += 1 + bu1;
+            if (klen < 0) { offset += pos; continue; }
+            if ((size_t)klen + 2 > rem - pos) break;
+            const char *kptr = p + pos; size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // one or more elements (prepend to list)
+            size_t newlen = 0; int wrongtype = 0; int had_error = 0;
+            long remaining = arrlen - 2;
+            for (long i = 0; i < remaining; i++)
+            {
+                if (pos >= rem || p[pos] != '$') { wrongtype = 0; break; }
+                long elen = 0; size_t bu2 = 0;
+                if (parse_crlf_int(p + pos + 1, rem - pos - 1, &elen, &bu2) != 0) { wrongtype = 0; break; }
+                pos += 1 + bu2;
+                if (elen < 0) { offset += pos; continue; }
+                if ((size_t)elen + 2 > rem - pos) { wrongtype = 0; break; }
+                const char *eptr = p + pos; size_t esz = (size_t)elen;
+                pos += esz;
+                if (pos + 2 > rem) { wrongtype = 0; break; }
+                if (p[pos] != '\r' || p[pos+1] != '\n') { offset += pos + 2; continue; }
+                pos += 2;
+
+                if (db_list_lpush(db, kptr, ksz, eptr, esz, &newlen, &wrongtype) != 0)
+                {
+                    const char err[] = "-ERR lpush failed\r\n";
+                    if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
+                    offset += pos; had_error = 1; break;
+                }
+                if (wrongtype)
+                {
+                    const char wt[] = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+                    if (send_all(fd, wt, sizeof(wt) - 1) != 0) return -1;
+                    offset += pos; had_error = 1; break;
+                }
+            }
+            if (had_error) { continue; }
+            char ibuf[64];
+            int il = snprintf(ibuf, sizeof(ibuf), ":%zu\r\n", newlen);
+            if (il <= 0 || (size_t)il >= sizeof(ibuf)) return -1;
+            if (send_all(fd, ibuf, (size_t)il) != 0) return -1;
+            offset += pos; continue;
+        }
         else if (arrlen == 4 && cmdlen == 6 && ascii_casecmp_n(cmd, "LRANGE", 6) == 0)
         {
             // key
