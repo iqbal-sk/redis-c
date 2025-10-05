@@ -24,6 +24,277 @@ static int emit_bulk_write(void *ctx, const char *val, size_t vlen)
     return 0;
 }
 
+// Lightweight arg slice
+typedef struct Arg { const char *ptr; size_t len; } Arg;
+
+typedef int (*cmd_handler)(int fd, Conn *c, DB *db, const Arg *args, size_t nargs);
+
+static int handle_ping(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c); UNUSED(db);
+    if (nargs == 0) return reply_simple(fd, "PONG");
+    // Redis ECHO-like PING <message> returns bulk, but our prior impl handled no-arg only.
+    // Keep behavior: if extra args, treat as unknown usage.
+    return reply_simple(fd, "PONG");
+}
+
+static int handle_echo(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c); UNUSED(db);
+    if (nargs != 1) return reply_error(fd, "ERR wrong number of arguments for 'ECHO'");
+    return reply_bulk(fd, args[0].ptr, args[0].len);
+}
+
+static int handle_set(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs < 2) return reply_error(fd, "ERR wrong number of arguments for 'SET'");
+    const char *kptr = args[0].ptr; size_t ksz = args[0].len;
+    const char *vptr = args[1].ptr; size_t vsz = args[1].len;
+    int64_t expires_at = 0;
+    size_t i = 2;
+    while (i + 1 < nargs)
+    {
+        const Arg *oname = &args[i];
+        const Arg *oval  = &args[i+1];
+        // Only EX/PX supported
+        if (oname->len == 2 && ascii_casecmp_n(oname->ptr, "EX", 2) == 0)
+        {
+            int64_t sec = 0;
+            if (parse_i64_ascii(oval->ptr, oval->len, &sec) != 0 || sec <= 0)
+                return reply_error(fd, "ERR syntax error");
+            expires_at = now_ms() + sec * 1000;
+        }
+        else if (oname->len == 2 && ascii_casecmp_n(oname->ptr, "PX", 2) == 0)
+        {
+            int64_t ms = 0;
+            if (parse_i64_ascii(oval->ptr, oval->len, &ms) != 0 || ms <= 0)
+                return reply_error(fd, "ERR syntax error");
+            expires_at = now_ms() + ms;
+        }
+        else
+        {
+            return reply_error(fd, "ERR syntax error");
+        }
+        i += 2;
+    }
+    db_set(db, kptr, ksz, vptr, vsz, expires_at);
+    return reply_simple(fd, "OK");
+}
+
+static int handle_get(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs != 1) return reply_error(fd, "ERR wrong number of arguments for 'GET'");
+    const char *vptr = NULL; size_t vsz = 0;
+    if (db_get(db, args[0].ptr, args[0].len, &vptr, &vsz) == 0)
+        return reply_bulk(fd, vptr, vsz);
+    return reply_null_bulk(fd);
+}
+
+static int handle_type(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs != 1) return reply_error(fd, "ERR wrong number of arguments for 'TYPE'");
+    ObjType t = OBJ_STRING; int found = 0;
+    if (db_type(db, args[0].ptr, args[0].len, &t, &found) != 0)
+        return -1;
+    if (!found) return reply_simple(fd, "none");
+    if (t == OBJ_STRING) return reply_simple(fd, "string");
+    if (t == OBJ_LIST) return reply_simple(fd, "list");
+    if (t == OBJ_STREAM) return reply_simple(fd, "stream");
+    return reply_simple(fd, "none");
+}
+
+static int handle_llen(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs != 1) return reply_error(fd, "ERR wrong number of arguments for 'LLEN'");
+    size_t llen = 0; int wrongtype = 0;
+    int rc = db_list_length(db, args[0].ptr, args[0].len, &llen, &wrongtype);
+    if (rc != 0 && wrongtype)
+        return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    return reply_int(fd, (long long)llen);
+}
+
+static int handle_lpop(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs < 1 || nargs > 2) return reply_error(fd, "ERR wrong number of arguments for 'LPOP'");
+    if (nargs == 1)
+    {
+        int wrongtype = 0; char *v = NULL; size_t vlen = 0;
+        int rc = db_list_lpop(db, args[0].ptr, args[0].len, &v, &vlen, &wrongtype);
+        if (rc < 0 && wrongtype)
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        if (rc != 0 || !v) return reply_null_bulk(fd);
+        int wrc = reply_bulk(fd, v, vlen);
+        free(v);
+        return wrc;
+    }
+    // nargs == 2: LPOP key count
+    int64_t cnt = 0;
+    if (parse_i64_ascii(args[1].ptr, args[1].len, &cnt) != 0 || cnt <= 0)
+        return reply_error(fd, "ERR value is not an integer or out of range");
+    size_t cap = (size_t)cnt;
+    char **vals = (char **)calloc(cap, sizeof(char*));
+    size_t *vls = (size_t *)calloc(cap, sizeof(size_t));
+    if (!vals || !vls) { free(vals); free(vls); return -1; }
+    size_t popped = 0; int wrongtype = 0;
+    for (long i = 0; i < cnt; i++)
+    {
+        char *v = NULL; size_t vlen = 0; int rc = db_list_lpop(db, args[0].ptr, args[0].len, &v, &vlen, &wrongtype);
+        if (rc < 0 && wrongtype)
+        {
+            for (size_t j = 0; j < popped; j++) free(vals[j]);
+            free(vals); free(vls);
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        if (rc != 0 || !v) break;
+        vals[popped] = v; vls[popped] = vlen; popped++;
+    }
+    int rc = reply_array_header(fd, popped);
+    if (rc != 0)
+    {
+        for (size_t j = 0; j < popped; j++) free(vals[j]);
+        free(vals); free(vls);
+        return -1;
+    }
+    for (size_t i = 0; i < popped; i++)
+    {
+        if (reply_bulk(fd, vals[i], vls[i]) != 0)
+        {
+            for (size_t j = 0; j < popped; j++) free(vals[j]);
+            free(vals); free(vls);
+            return -1;
+        }
+    }
+    for (size_t j = 0; j < popped; j++) free(vals[j]);
+    free(vals); free(vls);
+    return 0;
+}
+
+static int handle_rpush(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs < 2) return reply_error(fd, "ERR wrong number of arguments for 'RPUSH'");
+    const char *kptr = args[0].ptr; size_t ksz = args[0].len;
+    size_t newlen = 0; int wrongtype = 0;
+    for (size_t i = 1; i < nargs; i++)
+    {
+        if (db_list_rpush(db, kptr, ksz, args[i].ptr, args[i].len, &newlen, &wrongtype) != 0)
+            return reply_error(fd, "ERR rpush failed");
+        if (wrongtype)
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    return reply_int(fd, (long long)newlen);
+}
+
+static int handle_lpush(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs < 2) return reply_error(fd, "ERR wrong number of arguments for 'LPUSH'");
+    const char *kptr = args[0].ptr; size_t ksz = args[0].len;
+    size_t newlen = 0; int wrongtype = 0;
+    for (size_t i = 1; i < nargs; i++)
+    {
+        if (db_list_lpush(db, kptr, ksz, args[i].ptr, args[i].len, &newlen, &wrongtype) != 0)
+            return reply_error(fd, "ERR lpush failed");
+        if (wrongtype)
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    return reply_int(fd, (long long)newlen);
+}
+
+static int handle_lrange(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs != 3) return reply_error(fd, "ERR wrong number of arguments for 'LRANGE'");
+    int64_t s64 = 0, e64 = 0;
+    if (parse_i64_ascii(args[1].ptr, args[1].len, &s64) != 0 ||
+        parse_i64_ascii(args[2].ptr, args[2].len, &e64) != 0)
+        return reply_error(fd, "ERR value is not an integer or out of range");
+    size_t cnt = 0; int wrongtype = 0;
+    if (db_list_range_count(db, args[0].ptr, args[0].len, (long)s64, (long)e64, &cnt, &wrongtype) != 0)
+    {
+        if (wrongtype)
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        // else treat as empty
+        cnt = 0;
+    }
+    if (reply_array_header(fd, cnt) != 0) return -1;
+    if (cnt == 0) return 0;
+    int fd_ctx = fd; wrongtype = 0;
+    if (db_list_range_emit(db, args[0].ptr, args[0].len, (long)s64, (long)e64, emit_bulk_write, &fd_ctx, &wrongtype) != 0)
+        return -1;
+    return 0;
+}
+
+static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    // XADD key id field value [field value ...]
+    if (nargs < 3) return reply_error(fd, "ERR wrong number of arguments for 'XADD'");
+    const char *kptr = args[0].ptr; size_t ksz = args[0].len;
+    const char *idptr = args[1].ptr; size_t idsz = args[1].len;
+    size_t rem = nargs - 2;
+    if (rem < 2 || (rem % 2) != 0) return reply_error(fd, "ERR wrong number of arguments for 'XADD'");
+
+    size_t npairs = rem / 2;
+    const char **fkeys = (const char**)calloc(npairs, sizeof(char*));
+    const char **fvals = (const char**)calloc(npairs, sizeof(char*));
+    size_t *fklen = (size_t*)calloc(npairs, sizeof(size_t));
+    size_t *fvlen = (size_t*)calloc(npairs, sizeof(size_t));
+    if (!fkeys || !fvals || !fklen || !fvlen)
+    {
+        free(fkeys); free(fvals); free(fklen); free(fvlen);
+        return -1;
+    }
+    for (size_t i = 0; i < npairs; i++)
+    {
+        fkeys[i] = args[2 + i*2].ptr; fklen[i] = args[2 + i*2].len;
+        fvals[i] = args[2 + i*2 + 1].ptr; fvlen[i] = args[2 + i*2 + 1].len;
+    }
+    int wrongtype = 0;
+    int rc = db_stream_xadd(db, kptr, ksz, idptr, idsz, fkeys, fklen, fvals, fvlen, npairs, &wrongtype);
+    free(fkeys); free(fvals); free(fklen); free(fvlen);
+    if (rc != 0 && wrongtype)
+        return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    if (rc != 0)
+        return reply_error(fd, "ERR xadd failed");
+    // Return the ID we just appended as bulk
+    return reply_bulk(fd, idptr, idsz);
+}
+
+typedef struct CmdDef { const char *name; size_t nlen; cmd_handler fn; } CmdDef;
+
+static const CmdDef kCmds[] = {
+    { "PING", 4, handle_ping },
+    { "ECHO", 4, handle_echo },
+    { "SET", 3, handle_set },
+    { "GET", 3, handle_get },
+    { "TYPE", 4, handle_type },
+    // Lists
+    { "LLEN", 4, handle_llen },
+    { "LPOP", 4, handle_lpop },
+    { "RPUSH", 5, handle_rpush },
+    { "LPUSH", 5, handle_lpush },
+    { "LRANGE", 6, handle_lrange },
+    // Streams
+    { "XADD", 4, handle_xadd },
+};
+
+static const CmdDef* find_cmd(const char *name, size_t nlen)
+{
+    for (size_t i = 0; i < sizeof(kCmds)/sizeof(kCmds[0]); i++)
+    {
+        const CmdDef *d = &kCmds[i];
+        if (d->nlen == nlen && ascii_casecmp_n(name, d->name, nlen) == 0)
+            return d;
+    }
+    return NULL;
+}
+
 int ensure_capacity(Conn *c, size_t need)
 {
     if (c->cap >= need)
@@ -117,55 +388,45 @@ int process_conn(int fd, Conn *c, DB *db)
         }
         pos += 2;
 
-        if (arrlen == 1 && cmdlen == 4 && ascii_casecmp_n(cmd, "PING", 4) == 0)
+        // Dispatch-table path for a subset of commands
+        const CmdDef *def = find_cmd(cmd, cmdlen);
+        if (def)
         {
-            if (reply_simple(fd, "PONG") != 0)
-                return -1;
-            offset += pos;
-            continue;
-        }
-        else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "ECHO", 4) == 0)
-        {
-            if (pos >= rem || p[pos] != '$')
-                break;
-            long arglen = 0;
-            size_t abu = 0;
-            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &arglen, &abu) != 0)
-                break;
-            pos += 1 + abu;
-            if (arglen < 0)
+            long nargs = arrlen - 1;
+            if (nargs < 0) { offset += pos; continue; }
+            // Collect all bulk args as slices
+            Arg *args = NULL;
+            if (nargs > 0)
             {
-                offset += pos;
-                continue;
+                args = (Arg*)calloc((size_t)nargs, sizeof(Arg));
+                if (!args) return -1;
+                for (long i = 0; i < nargs; i++)
+                {
+                    if (pos >= rem || p[pos] != '$') { free(args); args = NULL; goto need_more; }
+                    long alen = 0; size_t abu = 0;
+                    if (parse_crlf_int(p + pos + 1, rem - pos - 1, &alen, &abu) != 0) { free(args); args = NULL; goto need_more; }
+                    pos += 1 + abu;
+                    if (alen < 0) { free(args); args = NULL; goto need_more; }
+                    if ((size_t)alen + 2 > rem - pos) { free(args); args = NULL; goto need_more; }
+                    args[i].ptr = p + pos; args[i].len = (size_t)alen;
+                    pos += (size_t)alen;
+                    if (pos + 2 > rem) { free(args); args = NULL; goto need_more; }
+                    if (p[pos] != '\r' || p[pos + 1] != '\n') { free(args); args = NULL; goto need_more; }
+                    pos += 2;
+                }
             }
-            if ((size_t)arglen + 2 > rem - pos)
-                break;
-            const char *arg = p + pos;
-            size_t argsz = (size_t)arglen;
-            pos += argsz;
-            if (pos + 2 > rem)
-                break;
-            if (p[pos] != '\r' || p[pos + 1] != '\n')
             {
-                offset += pos + 2;
-                continue;
+                int rc = def->fn(fd, c, db, args, (size_t)nargs);
+                free(args);
+                if (rc != 0) return -1;
+                offset += pos; continue;
             }
-            pos += 2;
-
-            char header[64];
-            int hl = snprintf(header, sizeof(header), "$%zu\r\n", argsz);
-            if (hl <= 0 || (size_t)hl >= sizeof(header))
-                return -1;
-            if (send_all(fd, header, (size_t)hl) != 0)
-                return -1;
-            if (send_all(fd, arg, argsz) != 0)
-                return -1;
-            if (send_all(fd, "\r\n", 2) != 0)
-                return -1;
-
-            offset += pos;
-            continue;
+        need_more:
+            // Not enough bytes to parse all args yet
+            if (args) free(args);
+            break;
         }
+        if (0) {}
         else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "LLEN", 4) == 0)
         {
             if (pos >= rem || p[pos] != '$')
@@ -222,180 +483,7 @@ int process_conn(int fd, Conn *c, DB *db)
             offset += pos;
             continue;
         }
-        else if (arrlen >= 3 && cmdlen == 3 && ascii_casecmp_n(cmd, "SET", 3) == 0)
-        {
-            // key
-            if (pos >= rem || p[pos] != '$')
-                break;
-            long klen = 0;
-            size_t bu1 = 0;
-            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
-                break;
-            pos += 1 + bu1;
-            if (klen < 0)
-            {
-                offset += pos;
-                continue;
-            }
-            if ((size_t)klen + 2 > rem - pos)
-                break;
-            const char *kptr = p + pos;
-            size_t ksz = (size_t)klen;
-            pos += ksz;
-            if (pos + 2 > rem)
-                break;
-            if (p[pos] != '\r' || p[pos + 1] != '\n')
-            {
-                offset += pos + 2;
-                continue;
-            }
-            pos += 2;
-            // value
-            if (pos >= rem || p[pos] != '$')
-                break;
-            long vlen = 0;
-            size_t bu2 = 0;
-            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &vlen, &bu2) != 0)
-                break;
-            pos += 1 + bu2;
-            if (vlen < 0)
-            {
-                offset += pos;
-                continue;
-            }
-            if ((size_t)vlen + 2 > rem - pos)
-                break;
-            const char *vptr = p + pos;
-            size_t vsz = (size_t)vlen;
-            pos += vsz;
-            if (pos + 2 > rem)
-                break;
-            if (p[pos] != '\r' || p[pos + 1] != '\n')
-            {
-                offset += pos + 2;
-                continue;
-            }
-            pos += 2;
-
-            int64_t expires_at = 0;
-            long remaining = arrlen - 3; // options
-            while (remaining >= 2)
-            {
-                if (pos >= rem || p[pos] != '$')
-                    break;
-                long onamelen = 0;
-                size_t buo = 0;
-                if (parse_crlf_int(p + pos + 1, rem - pos - 1, &onamelen, &buo) != 0)
-                    break;
-                pos += 1 + buo;
-                if (onamelen < 0)
-                {
-                    offset += pos;
-                    continue;
-                }
-                if ((size_t)onamelen + 2 > rem - pos)
-                    break;
-                const char *oname = p + pos;
-                size_t onamensz = (size_t)onamelen;
-                pos += onamensz;
-                if (pos + 2 > rem)
-                    break;
-                if (p[pos] != '\r' || p[pos + 1] != '\n')
-                {
-                    offset += pos + 2;
-                    continue;
-                }
-                pos += 2;
-                if (pos >= rem || p[pos] != '$')
-                    break;
-                long oval_len = 0;
-                size_t buv = 0;
-                if (parse_crlf_int(p + pos + 1, rem - pos - 1, &oval_len, &buv) != 0)
-                    break;
-                pos += 1 + buv;
-                if (oval_len < 0)
-                {
-                    offset += pos;
-                    continue;
-                }
-                if ((size_t)oval_len + 2 > rem - pos)
-                    break;
-                const char *oval = p + pos;
-                size_t oval_sz = (size_t)oval_len;
-                pos += oval_sz;
-                if (pos + 2 > rem)
-                    break;
-                if (p[pos] != '\r' || p[pos + 1] != '\n')
-                {
-                    offset += pos + 2;
-                    continue;
-                }
-                pos += 2;
-
-                // parse ttl
-                long ttl_num = 0;
-                int oknum = 1;
-                long tmp = 0;
-                int neg = 0;
-                int any = 0;
-                for (size_t i = 0; i < oval_sz; i++)
-                {
-                    char ch = oval[i];
-                    if (i == 0 && ch == '-')
-                    {
-                        neg = 1;
-                        continue;
-                    }
-                    if (ch < '0' || ch > '9')
-                    {
-                        oknum = 0;
-                        break;
-                    }
-                    any = 1;
-                    tmp = tmp * 10 + (ch - '0');
-                }
-                if (!any || neg || !oknum)
-                    tmp = -1;
-                ttl_num = tmp;
-
-                if (onamensz == 2 && ascii_casecmp_n(oname, "EX", 2) == 0)
-                {
-                    if (ttl_num <= 0)
-                    {
-                        if (reply_error(fd, "ERR syntax error") != 0)
-                            return -1;
-                        offset += pos;
-                        continue;
-                    }
-                    expires_at = now_ms() + (int64_t)ttl_num * 1000;
-                }
-                else if (onamensz == 2 && ascii_casecmp_n(oname, "PX", 2) == 0)
-                {
-                    if (ttl_num <= 0)
-                    {
-                        if (reply_error(fd, "ERR syntax error") != 0)
-                            return -1;
-                        offset += pos;
-                        continue;
-                    }
-                    expires_at = now_ms() + (int64_t)ttl_num;
-                }
-                else
-                {
-                    if (reply_error(fd, "ERR syntax error") != 0)
-                        return -1;
-                    offset += pos;
-                    continue;
-                }
-                remaining -= 2;
-            }
-
-            db_set(db, kptr, ksz, vptr, vsz, expires_at);
-            if (reply_simple(fd, "OK") != 0)
-                return -1;
-            offset += pos;
-            continue;
-        }
+        else if (0) {}
         else if (arrlen >= 3 && cmdlen == 5 && ascii_casecmp_n(cmd, "RPUSH", 5) == 0)
         {
             // key
@@ -1077,122 +1165,8 @@ int process_conn(int fd, Conn *c, DB *db)
             offset += pos;
             continue;
         }
-        else if (arrlen == 2 && cmdlen == 3 && ascii_casecmp_n(cmd, "GET", 3) == 0)
-        {
-            if (pos >= rem || p[pos] != '$')
-                break;
-            long klen = 0;
-            size_t bu1 = 0;
-            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
-                break;
-            pos += 1 + bu1;
-            if (klen < 0)
-            {
-                offset += pos;
-                continue;
-            }
-            if ((size_t)klen + 2 > rem - pos)
-                break;
-            const char *kptr = p + pos;
-            size_t ksz = (size_t)klen;
-            pos += ksz;
-            if (pos + 2 > rem)
-                break;
-            if (p[pos] != '\r' || p[pos + 1] != '\n')
-            {
-                offset += pos + 2;
-                continue;
-            }
-            pos += 2;
-
-            const char *vptr = NULL;
-            size_t vsz = 0;
-            if (db_get(db, kptr, ksz, &vptr, &vsz) == 0)
-            {
-                if (reply_bulk(fd, vptr, vsz) != 0)
-                    return -1;
-            }
-            else
-            {
-                if (reply_null_bulk(fd) != 0)
-                    return -1;
-            }
-            offset += pos;
-            continue;
-        }
-        else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "TYPE", 4) == 0)
-        {
-            // key
-            if (pos >= rem || p[pos] != '$')
-                break;
-            long klen = 0;
-            size_t bu1 = 0;
-            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
-                break;
-            pos += 1 + bu1;
-            if (klen < 0) { offset += pos; continue; }
-            if ((size_t)klen + 2 > rem - pos) break;
-            const char *kptr = p + pos; size_t ksz = (size_t)klen;
-            pos += ksz;
-            if (pos + 2 > rem) break;
-            if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
-            pos += 2;
-
-            ObjType t = OBJ_STRING; int found = 0;
-            if (db_type(db, kptr, ksz, &t, &found) != 0)
-                return -1;
-
-            if (!found)
-            {
-                if (reply_simple(fd, "none") != 0) return -1;
-            }
-            else if (t == OBJ_STRING)
-            {
-                if (reply_simple(fd, "string") != 0) return -1;
-            }
-            else if (t == OBJ_LIST)
-            {
-                if (reply_simple(fd, "list") != 0) return -1;
-            }
-            else
-            {
-                if (reply_simple(fd, "none") != 0) return -1;
-            }
-            offset += pos; continue;
-        }
-        else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "TYPE", 4) == 0)
-        {
-            // key
-            if (pos >= rem || p[pos] != '$')
-                break;
-            long klen = 0;
-            size_t bu1 = 0;
-            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
-                break;
-            pos += 1 + bu1;
-            if (klen < 0) { offset += pos; continue; }
-            if ((size_t)klen + 2 > rem - pos) break;
-            const char *kptr = p + pos; size_t ksz = (size_t)klen;
-            pos += ksz;
-            if (pos + 2 > rem) break;
-            if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
-            pos += 2;
-
-            ObjType t = OBJ_STRING; int found = 0;
-            if (db_type(db, kptr, ksz, &t, &found) != 0)
-                return -1;
-
-            const char *resp = "+none\r\n";
-            if (found)
-            {
-                if (t == OBJ_STRING) resp = "+string\r\n";
-                else if (t == OBJ_LIST) resp = "+list\r\n";
-                else resp = "+none\r\n"; // fallback for unsupported types
-            }
-            if (send_all(fd, resp, strlen(resp)) != 0)
-                return -1;
-            offset += pos; continue;
-        }
+        else if (0) {}
+        else if (0) {}
         else
         {
             const char err[] = "-ERR unknown command\r\n";
