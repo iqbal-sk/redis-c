@@ -17,9 +17,10 @@ int main()
         db_free(&srv.db);
         return 1;
     }
+    // Provide server pointer to command layer (for BLPOP waiters)
+    commands_set_server(&srv);
     int rc = server_event_loop(&srv);
     close(srv.listen_fd);
     db_free(&srv.db);
     return rc;
 }
-
