@@ -119,8 +119,7 @@ int process_conn(int fd, Conn *c, DB *db)
 
         if (arrlen == 1 && cmdlen == 4 && ascii_casecmp_n(cmd, "PING", 4) == 0)
         {
-            const char pong[] = "+PONG\r\n";
-            if (send_all(fd, pong, sizeof(pong) - 1) != 0)
+            if (reply_simple(fd, "PONG") != 0)
                 return -1;
             offset += pos;
             continue;
@@ -363,8 +362,7 @@ int process_conn(int fd, Conn *c, DB *db)
                 {
                     if (ttl_num <= 0)
                     {
-                        const char err[] = "-ERR syntax error\r\n";
-                        if (send_all(fd, err, sizeof(err) - 1) != 0)
+                        if (reply_error(fd, "ERR syntax error") != 0)
                             return -1;
                         offset += pos;
                         continue;
@@ -375,8 +373,7 @@ int process_conn(int fd, Conn *c, DB *db)
                 {
                     if (ttl_num <= 0)
                     {
-                        const char err[] = "-ERR syntax error\r\n";
-                        if (send_all(fd, err, sizeof(err) - 1) != 0)
+                        if (reply_error(fd, "ERR syntax error") != 0)
                             return -1;
                         offset += pos;
                         continue;
@@ -385,8 +382,7 @@ int process_conn(int fd, Conn *c, DB *db)
                 }
                 else
                 {
-                    const char err[] = "-ERR syntax error\r\n";
-                    if (send_all(fd, err, sizeof(err) - 1) != 0)
+                    if (reply_error(fd, "ERR syntax error") != 0)
                         return -1;
                     offset += pos;
                     continue;
@@ -395,8 +391,7 @@ int process_conn(int fd, Conn *c, DB *db)
             }
 
             db_set(db, kptr, ksz, vptr, vsz, expires_at);
-            const char ok[] = "+OK\r\n";
-            if (send_all(fd, ok, sizeof(ok) - 1) != 0)
+            if (reply_simple(fd, "OK") != 0)
                 return -1;
             offset += pos;
             continue;
@@ -1114,25 +1109,56 @@ int process_conn(int fd, Conn *c, DB *db)
             size_t vsz = 0;
             if (db_get(db, kptr, ksz, &vptr, &vsz) == 0)
             {
-                char header[64];
-                int hl = snprintf(header, sizeof(header), "$%zu\r\n", vsz);
-                if (hl <= 0 || (size_t)hl >= sizeof(header))
-                    return -1;
-                if (send_all(fd, header, (size_t)hl) != 0)
-                    return -1;
-                if (send_all(fd, vptr, vsz) != 0)
-                    return -1;
-                if (send_all(fd, "\r\n", 2) != 0)
+                if (reply_bulk(fd, vptr, vsz) != 0)
                     return -1;
             }
             else
             {
-                const char nullbulk[] = "$-1\r\n";
-                if (send_all(fd, nullbulk, sizeof(nullbulk) - 1) != 0)
+                if (reply_null_bulk(fd) != 0)
                     return -1;
             }
             offset += pos;
             continue;
+        }
+        else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "TYPE", 4) == 0)
+        {
+            // key
+            if (pos >= rem || p[pos] != '$')
+                break;
+            long klen = 0;
+            size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
+                break;
+            pos += 1 + bu1;
+            if (klen < 0) { offset += pos; continue; }
+            if ((size_t)klen + 2 > rem - pos) break;
+            const char *kptr = p + pos; size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            ObjType t = OBJ_STRING; int found = 0;
+            if (db_type(db, kptr, ksz, &t, &found) != 0)
+                return -1;
+
+            if (!found)
+            {
+                if (reply_simple(fd, "none") != 0) return -1;
+            }
+            else if (t == OBJ_STRING)
+            {
+                if (reply_simple(fd, "string") != 0) return -1;
+            }
+            else if (t == OBJ_LIST)
+            {
+                if (reply_simple(fd, "list") != 0) return -1;
+            }
+            else
+            {
+                if (reply_simple(fd, "none") != 0) return -1;
+            }
+            offset += pos; continue;
         }
         else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "TYPE", 4) == 0)
         {
