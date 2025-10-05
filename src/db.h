@@ -4,7 +4,8 @@
 typedef enum
 {
     OBJ_STRING = 0,
-    OBJ_LIST = 1
+    OBJ_LIST = 1,
+    OBJ_STREAM = 2
 } ObjType;
 
 typedef struct ListNode
@@ -33,6 +34,10 @@ typedef struct Entry
             size_t len;
         } str;
         List list;
+        struct Stream {
+            struct StreamEntry *head, *tail;
+            size_t len;
+        } stream;
     } data;
     int64_t expires_at_ms; // 0 => no expiry
     struct Entry *next;
@@ -64,3 +69,11 @@ int db_list_range_count(DB *db, const char *key, size_t klen, long start, long s
 typedef int (*db_emit_cb)(void *ctx, const char *val, size_t vlen);
 int db_list_range_emit(DB *db, const char *key, size_t klen, long start, long stop, db_emit_cb emit, void *ctx, int *wrongtype);
 int db_list_length(DB *db, const char *key, size_t klen, size_t *out_len, int *wrongtype);
+
+// Streams
+int db_stream_xadd(DB *db, const char *key, size_t klen,
+                   const char *id, size_t idlen,
+                   const char **fkeys, const size_t *fklen,
+                   const char **fvals, const size_t *fvlen,
+                   size_t npairs,
+                   int *wrongtype);

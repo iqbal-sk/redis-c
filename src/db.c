@@ -30,6 +30,50 @@ static void list_free(List *lst)
     lst->len = 0;
 }
 
+typedef struct StreamField
+{
+    char *key; size_t klen;
+    char *val; size_t vlen;
+    struct StreamField *next;
+} StreamField;
+
+typedef struct StreamEntry
+{
+    char *id; size_t idlen;
+    StreamField *fields;
+    struct StreamEntry *next;
+} StreamEntry;
+
+static void stream_entry_free(StreamEntry *e)
+{
+    if (!e) return;
+    free(e->id);
+    StreamField *f = e->fields;
+    while (f)
+    {
+        StreamField *nx = f->next;
+        free(f->key);
+        free(f->val);
+        free(f);
+        f = nx;
+    }
+    free(e);
+}
+
+static void stream_free(struct Stream *st)
+{
+    if (!st) return;
+    StreamEntry *e = st->head;
+    while (e)
+    {
+        StreamEntry *nx = e->next;
+        stream_entry_free(e);
+        e = nx;
+    }
+    st->head = st->tail = NULL;
+    st->len = 0;
+}
+
 void db_free(DB *db)
 {
     if (!db || !db->buckets)
@@ -48,6 +92,10 @@ void db_free(DB *db)
             else if (e->type == OBJ_LIST)
             {
                 list_free(&e->data.list);
+            }
+            else if (e->type == OBJ_STREAM)
+            {
+                stream_free(&e->data.stream);
             }
             free(e);
             e = n;
@@ -102,6 +150,8 @@ void db_del(DB *db, const char *key, size_t klen)
         free(e->data.str.ptr);
     else if (e->type == OBJ_LIST)
         list_free(&e->data.list);
+    else if (e->type == OBJ_STREAM)
+        stream_free(&e->data.stream);
     free(e);
 }
 
@@ -123,6 +173,10 @@ void db_set(DB *db, const char *key, size_t klen, const char *val, size_t vlen, 
         else if (e->type == OBJ_LIST)
         {
             list_free(&e->data.list);
+        }
+        else if (e->type == OBJ_STREAM)
+        {
+            stream_free(&e->data.stream);
         }
         e->type = OBJ_STRING;
         e->data.str.ptr = nval;
@@ -172,6 +226,8 @@ int db_get(DB *db, const char *key, size_t klen, const char **out_val, size_t *o
             free(e->data.str.ptr);
         else if (e->type == OBJ_LIST)
             list_free(&e->data.list);
+        else if (e->type == OBJ_STREAM)
+            stream_free(&e->data.stream);
         free(e);
         return -1;
     }
@@ -179,6 +235,81 @@ int db_get(DB *db, const char *key, size_t klen, const char **out_val, size_t *o
         return -1; // wrong type for GET (treat as missing for now)
     *out_val = e->data.str.ptr;
     *out_vlen = e->data.str.len;
+    return 0;
+}
+
+int db_stream_xadd(DB *db, const char *key, size_t klen,
+                   const char *id, size_t idlen,
+                   const char **fkeys, const size_t *fklen,
+                   const char **fvals, const size_t *fvlen,
+                   size_t npairs,
+                   int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e)
+    {
+        // create stream entry
+        Entry *ne = (Entry*)calloc(1, sizeof(Entry));
+        if (!ne) return -1;
+        ne->key = (char*)malloc(klen);
+        if (!ne->key && klen > 0) { free(ne); return -1; }
+        if (klen > 0) memcpy(ne->key, key, klen);
+        ne->klen = klen;
+        ne->type = OBJ_STREAM;
+        ne->expires_at_ms = 0;
+        ne->data.stream.head = ne->data.stream.tail = NULL;
+        ne->data.stream.len = 0;
+        ne->next = db->buckets[b];
+        db->buckets[b] = ne;
+        e = ne;
+    }
+    else if (e->type != OBJ_STREAM)
+    {
+        if (wrongtype) *wrongtype = 1;
+        return -1;
+    }
+
+    // Allocate new stream entry
+    StreamEntry *se = (StreamEntry*)calloc(1, sizeof(StreamEntry));
+    if (!se) return -1;
+    se->id = (char*)malloc(idlen);
+    if (!se->id && idlen > 0) { free(se); return -1; }
+    if (idlen > 0) memcpy(se->id, id, idlen);
+    se->idlen = idlen;
+    se->fields = NULL; se->next = NULL;
+
+    // Build fields list (in order)
+    StreamField *head = NULL, *tail = NULL;
+    for (size_t i = 0; i < npairs; i++)
+    {
+        StreamField *sf = (StreamField*)calloc(1, sizeof(StreamField));
+        if (!sf) { stream_entry_free(se); return -1; }
+        sf->key = (char*)malloc(fklen[i]);
+        sf->val = (char*)malloc(fvlen[i]);
+        if ((fklen[i] > 0 && !sf->key) || (fvlen[i] > 0 && !sf->val))
+        {
+            free(sf->key); free(sf->val); free(sf);
+            stream_entry_free(se);
+            return -1;
+        }
+        if (fklen[i] > 0) memcpy(sf->key, fkeys[i], fklen[i]);
+        if (fvlen[i] > 0) memcpy(sf->val, fvals[i], fvlen[i]);
+        sf->klen = fklen[i]; sf->vlen = fvlen[i]; sf->next = NULL;
+        if (!head) head = tail = sf; else { tail->next = sf; tail = sf; }
+    }
+    se->fields = head;
+
+    // Append to stream
+    if (!e->data.stream.tail)
+        e->data.stream.head = e->data.stream.tail = se;
+    else
+    {
+        e->data.stream.tail->next = se;
+        e->data.stream.tail = se;
+    }
+    e->data.stream.len++;
     return 0;
 }
 
