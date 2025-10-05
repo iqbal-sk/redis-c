@@ -1,4 +1,12 @@
 #include "commands.h"
+#include "server.h"
+
+static Server *g_srv = NULL;
+
+void commands_set_server(Server *srv)
+{
+    g_srv = srv;
+}
 
 static int emit_bulk_write(void *ctx, const char *val, size_t vlen)
 {
@@ -780,6 +788,88 @@ int process_conn(int fd, Conn *c, DB *db)
             free(v);
             offset += pos;
             continue;
+        }
+        else if (arrlen == 3 && cmdlen == 5 && ascii_casecmp_n(cmd, "BLPOP", 5) == 0)
+        {
+            // key
+            if (pos >= rem || p[pos] != '$')
+                break;
+            long klen = 0; size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
+                break;
+            pos += 1 + bu1;
+            if (klen < 0) { offset += pos; continue; }
+            if ((size_t)klen + 2 > rem - pos) break;
+            const char *kptr = p + pos; size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            // timeout seconds as bulk
+            if (pos >= rem || p[pos] != '$') break;
+            long tlen = 0; size_t but = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &tlen, &but) != 0) break;
+            pos += 1 + but;
+            if (tlen < 0) { offset += pos; continue; }
+            if ((size_t)tlen + 2 > rem - pos) break;
+            const char *tptr = p + pos; size_t tsz = (size_t)tlen;
+            pos += tsz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            long to_secs = 0; int ok = 1; int any = 0; long tmp = 0; int neg = 0;
+            for (size_t i = 0; i < tsz; i++)
+            {
+                char ch = tptr[i];
+                if (i == 0 && ch == '-') { neg = 1; continue; }
+                if (ch < '0' || ch > '9') { ok = 0; break; }
+                any = 1; tmp = tmp * 10 + (ch - '0');
+            }
+            if (!any) ok = 0; to_secs = neg ? -tmp : tmp;
+            if (!ok || to_secs < 0)
+            {
+                const char err[] = "-ERR value is not an integer or out of range\r\n";
+                if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
+                offset += pos; continue;
+            }
+
+            // Try immediate pop
+            int wrongtype = 0; char *v = NULL; size_t vlen = 0;
+            int rc = db_list_lpop(db, kptr, ksz, &v, &vlen, &wrongtype);
+            if (rc < 0 && wrongtype)
+            {
+                const char wt[] = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+                if (send_all(fd, wt, sizeof(wt) - 1) != 0) { if (v) free(v); return -1; }
+                offset += pos; if (v) free(v); continue;
+            }
+            if (rc == 0 && v)
+            {
+                // reply with [key, elem]
+                char h[64];
+                int hl = snprintf(h, sizeof(h), "*2\r\n");
+                if (hl <= 0 || (size_t)hl >= sizeof(h)) { free(v); return -1; }
+                if (send_all(fd, h, (size_t)hl) != 0) { free(v); return -1; }
+                hl = snprintf(h, sizeof(h), "$%zu\r\n", ksz);
+                if (hl <= 0 || (size_t)hl >= sizeof(h)) { free(v); return -1; }
+                if (send_all(fd, h, (size_t)hl) != 0) { free(v); return -1; }
+                if (send_all(fd, kptr, ksz) != 0) { free(v); return -1; }
+                if (send_all(fd, "\r\n", 2) != 0) { free(v); return -1; }
+                hl = snprintf(h, sizeof(h), "$%zu\r\n", vlen);
+                if (hl <= 0 || (size_t)hl >= sizeof(h)) { free(v); return -1; }
+                if (send_all(fd, h, (size_t)hl) != 0) { free(v); return -1; }
+                if (send_all(fd, v, vlen) != 0) { free(v); return -1; }
+                if (send_all(fd, "\r\n", 2) != 0) { free(v); return -1; }
+                free(v);
+                offset += pos; continue;
+            }
+
+            // Otherwise, register waiter (0 timeout => infinite)
+            int64_t deadline = (to_secs == 0) ? 0 : (now_ms() + (int64_t)to_secs * 1000);
+            if (g_srv)
+                server_add_waiter(g_srv, c, fd, kptr, ksz, deadline);
+            offset += pos; continue;
         }
         else if (arrlen == 4 && cmdlen == 6 && ascii_casecmp_n(cmd, "LRANGE", 6) == 0)
         {
