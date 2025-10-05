@@ -50,6 +50,9 @@ void db_free(DB *db);
 void db_set(DB *db, const char *key, size_t klen, const char *val, size_t vlen, int64_t expires_at_ms);
 int db_get(DB *db, const char *key, size_t klen, const char **out_val, size_t *out_vlen);
 void db_del(DB *db, const char *key, size_t klen);
+// Query the type of a key. Sets *found=1 and *out_type when present and not expired,
+// otherwise sets *found=0. Returns 0 on success.
+int db_type(DB *db, const char *key, size_t klen, ObjType *out_type, int *found);
 
 int64_t now_ms(void);
 

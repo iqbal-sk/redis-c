@@ -1134,6 +1134,39 @@ int process_conn(int fd, Conn *c, DB *db)
             offset += pos;
             continue;
         }
+        else if (arrlen == 2 && cmdlen == 4 && ascii_casecmp_n(cmd, "TYPE", 4) == 0)
+        {
+            // key
+            if (pos >= rem || p[pos] != '$')
+                break;
+            long klen = 0;
+            size_t bu1 = 0;
+            if (parse_crlf_int(p + pos + 1, rem - pos - 1, &klen, &bu1) != 0)
+                break;
+            pos += 1 + bu1;
+            if (klen < 0) { offset += pos; continue; }
+            if ((size_t)klen + 2 > rem - pos) break;
+            const char *kptr = p + pos; size_t ksz = (size_t)klen;
+            pos += ksz;
+            if (pos + 2 > rem) break;
+            if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
+            pos += 2;
+
+            ObjType t = OBJ_STRING; int found = 0;
+            if (db_type(db, kptr, ksz, &t, &found) != 0)
+                return -1;
+
+            const char *resp = "+none\r\n";
+            if (found)
+            {
+                if (t == OBJ_STRING) resp = "+string\r\n";
+                else if (t == OBJ_LIST) resp = "+list\r\n";
+                else resp = "+none\r\n"; // fallback for unsupported types
+            }
+            if (send_all(fd, resp, strlen(resp)) != 0)
+                return -1;
+            offset += pos; continue;
+        }
         else
         {
             const char err[] = "-ERR unknown command\r\n";

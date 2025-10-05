@@ -182,6 +182,34 @@ int db_get(DB *db, const char *key, size_t klen, const char **out_val, size_t *o
     return 0;
 }
 
+int db_type(DB *db, const char *key, size_t klen, ObjType *out_type, int *found)
+{
+    if (found) *found = 0;
+    unsigned long b = 0;
+    Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e)
+        return 0;
+    if (e->expires_at_ms > 0 && now_ms() >= e->expires_at_ms)
+    {
+        // Expired: delete eagerly and report not found
+        if (prev)
+            prev->next = e->next;
+        else
+            db->buckets[b] = e->next;
+        free(e->key);
+        if (e->type == OBJ_STRING)
+            free(e->data.str.ptr);
+        else if (e->type == OBJ_LIST)
+            list_free(&e->data.list);
+        free(e);
+        return 0;
+    }
+    if (found) *found = 1;
+    if (out_type) *out_type = e->type;
+    return 0;
+}
+
 int db_list_rpush(DB *db, const char *key, size_t klen, const char *elem, size_t elen, size_t *out_len, int *wrongtype)
 {
     if (wrongtype)
