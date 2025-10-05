@@ -819,16 +819,42 @@ int process_conn(int fd, Conn *c, DB *db)
             if (p[pos] != '\r' || p[pos + 1] != '\n') { offset += pos + 2; continue; }
             pos += 2;
 
-            long to_secs = 0; int ok = 1; int any = 0; long tmp = 0; int neg = 0;
+            // parse timeout as non-negative seconds, supports fractional (e.g., 0.5)
+            int ok = 1; int any = 0; int seen_dot = 0; int frac_digits = 0; long long int_part = 0; long long frac_part = 0;
             for (size_t i = 0; i < tsz; i++)
             {
                 char ch = tptr[i];
-                if (i == 0 && ch == '-') { neg = 1; continue; }
+                if (ch == '.')
+                {
+                    if (seen_dot) { ok = 0; break; }
+                    seen_dot = 1; continue;
+                }
+                if (ch == '-') { ok = 0; break; }
                 if (ch < '0' || ch > '9') { ok = 0; break; }
-                any = 1; tmp = tmp * 10 + (ch - '0');
+                any = 1;
+                if (!seen_dot)
+                {
+                    int_part = int_part * 10 + (ch - '0');
+                }
+                else
+                {
+                    if (frac_digits < 3) { frac_part = frac_part * 10 + (ch - '0'); frac_digits++; }
+                    // ignore extra fractional digits beyond millisecond precision
+                }
             }
-            if (!any) ok = 0; to_secs = neg ? -tmp : tmp;
-            if (!ok || to_secs < 0)
+            if (!any) ok = 0;
+            // convert to milliseconds (truncate beyond 3 decimals)
+            long long to_ms = 0;
+            if (ok)
+            {
+                long long scale = 1;
+                if (frac_digits == 0) scale = 1000;
+                else if (frac_digits == 1) scale = 100;
+                else if (frac_digits == 2) scale = 10;
+                else scale = 1;
+                to_ms = int_part * 1000 + frac_part * scale;
+            }
+            if (!ok)
             {
                 const char err[] = "-ERR value is not an integer or out of range\r\n";
                 if (send_all(fd, err, sizeof(err) - 1) != 0) return -1;
@@ -866,7 +892,7 @@ int process_conn(int fd, Conn *c, DB *db)
             }
 
             // Otherwise, register waiter (0 timeout => infinite)
-            int64_t deadline = (to_secs == 0) ? 0 : (now_ms() + (int64_t)to_secs * 1000);
+            int64_t deadline = (to_ms == 0) ? 0 : (now_ms() + (int64_t)to_ms);
             if (g_srv)
                 server_add_waiter(g_srv, c, fd, kptr, ksz, deadline);
             offset += pos; continue;
