@@ -120,6 +120,8 @@ static int handle_type(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
         return reply_simple(fd, "string");
     if (t == OBJ_LIST)
         return reply_simple(fd, "list");
+    if (t == OBJ_STREAM)
+        return reply_simple(fd, "stream");
     return reply_simple(fd, "none");
 }
 
@@ -283,6 +285,43 @@ static int handle_lrange(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     return 0;
 }
 
+static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    // XADD key id field value [field value ...]
+    if (nargs < 3)
+        return reply_error(fd, "ERR wrong number of arguments for 'XADD'");
+    const char *kptr = args[0].ptr; size_t ksz = args[0].len;
+    const char *idptr = args[1].ptr; size_t idsz = args[1].len;
+    size_t rem = nargs - 2;
+    if (rem < 2 || (rem % 2) != 0)
+        return reply_error(fd, "ERR wrong number of arguments for 'XADD'");
+
+    size_t npairs = rem / 2;
+    const char **fkeys = (const char **)calloc(npairs, sizeof(char *));
+    const char **fvals = (const char **)calloc(npairs, sizeof(char *));
+    size_t *fklen = (size_t *)calloc(npairs, sizeof(size_t));
+    size_t *fvlen = (size_t *)calloc(npairs, sizeof(size_t));
+    if (!fkeys || !fvals || !fklen || !fvlen)
+    {
+        free(fkeys); free(fvals); free(fklen); free(fvlen);
+        return -1;
+    }
+    for (size_t i = 0; i < npairs; i++)
+    {
+        fkeys[i] = args[2 + i * 2].ptr; fklen[i] = args[2 + i * 2].len;
+        fvals[i] = args[2 + i * 2 + 1].ptr; fvlen[i] = args[2 + i * 2 + 1].len;
+    }
+    int wrongtype = 0;
+    int rc = db_stream_xadd(db, kptr, ksz, idptr, idsz, fkeys, fklen, fvals, fvlen, npairs, &wrongtype);
+    free(fkeys); free(fvals); free(fklen); free(fvlen);
+    if (rc != 0 && wrongtype)
+        return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    if (rc != 0)
+        return reply_error(fd, "ERR xadd failed");
+    return reply_bulk(fd, idptr, idsz);
+}
+
 typedef struct CmdDef
 {
     const char *name;
@@ -302,6 +341,8 @@ static const CmdDef kCmds[] = {
     {"RPUSH", 5, handle_rpush},
     {"LPUSH", 5, handle_lpush},
     {"LRANGE", 6, handle_lrange},
+    // Streams
+    {"XADD", 4, handle_xadd},
 };
 
 static const CmdDef *find_cmd(const char *name, size_t nlen)
