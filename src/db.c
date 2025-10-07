@@ -246,6 +246,38 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
                    int *wrongtype)
 {
     if (wrongtype) *wrongtype = 0;
+    // Validate provided ID: explicit millisecond-seq format "<ms>-<seq>"
+    // Parse new id into two unsigned integers
+    uint64_t new_ms = 0, new_seq = 0;
+    {
+        // Find dash
+        size_t dash = (size_t)-1;
+        for (size_t i = 0; i < idlen; i++)
+        {
+            if (id[i] == '-') { dash = i; break; }
+        }
+        if (dash == (size_t)-1)
+            return -1; // invalid format
+        // Parse ms
+        if (dash == 0) return -1; // empty ms
+        for (size_t i = 0; i < dash; i++)
+        {
+            char ch = id[i];
+            if (ch < '0' || ch > '9') return -1;
+            new_ms = new_ms * 10ULL + (uint64_t)(ch - '0');
+        }
+        // Parse seq
+        size_t seq_start = dash + 1;
+        if (seq_start >= idlen) return -1; // empty seq
+        for (size_t i = seq_start; i < idlen; i++)
+        {
+            char ch = id[i];
+            if (ch < '0' || ch > '9') return -1;
+            new_seq = new_seq * 10ULL + (uint64_t)(ch - '0');
+        }
+        if (new_ms == 0 && new_seq == 0)
+            return -2; // must be greater than 0-0
+    }
     unsigned long b = 0; Entry *prev = NULL;
     Entry *e = db_find(db, key, klen, &b, &prev);
     if (!e)
@@ -269,6 +301,34 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
     {
         if (wrongtype) *wrongtype = 1;
         return -1;
+    }
+
+    // If stream not empty, ensure new ID is strictly greater than last ID
+    if (e->data.stream.tail)
+    {
+        // Parse last id
+        uint64_t last_ms = 0, last_seq = 0;
+        const char *lid = e->data.stream.tail->id;
+        size_t lidlen = e->data.stream.tail->idlen;
+        size_t dash = (size_t)-1;
+        for (size_t i = 0; i < lidlen; i++)
+        {
+            if (lid[i] == '-') { dash = i; break; }
+        }
+        if (dash != (size_t)-1 && dash > 0 && dash + 1 < lidlen)
+        {
+            for (size_t i = 0; i < dash; i++)
+            {
+                last_ms = last_ms * 10ULL + (uint64_t)(lid[i] - '0');
+            }
+            for (size_t i = dash + 1; i < lidlen; i++)
+            {
+                last_seq = last_seq * 10ULL + (uint64_t)(lid[i] - '0');
+            }
+        }
+        // Validate strictly greater than last
+        if (new_ms < last_ms || (new_ms == last_ms && new_seq <= last_seq))
+            return -3; // equal or smaller than top item
     }
 
     // Allocate new stream entry

@@ -297,6 +297,33 @@ static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     if (rem < 2 || (rem % 2) != 0)
         return reply_error(fd, "ERR wrong number of arguments for 'XADD'");
 
+    // For this stage, only explicit IDs are supported: <ms>-<seq>
+    // Quick client-side validation for 0-0 to tailor error message early
+    {
+        size_t dash = (size_t)-1;
+        for (size_t i = 0; i < idsz; i++)
+            if (idptr[i] == '-') { dash = i; break; }
+        if (dash == (size_t)-1)
+            return reply_error(fd, "ERR xadd failed"); // generic invalid format
+        // Check numeric and detect 0-0 quickly
+        uint64_t ms = 0, seq = 0; int ok = 1;
+        if (dash == 0 || dash + 1 >= idsz) ok = 0;
+        for (size_t i = 0; ok && i < dash; i++)
+        {
+            char ch = idptr[i];
+            if (ch < '0' || ch > '9') ok = 0; else ms = ms * 10ULL + (uint64_t)(ch - '0');
+        }
+        for (size_t i = dash + 1; ok && i < idsz; i++)
+        {
+            char ch = idptr[i];
+            if (ch < '0' || ch > '9') ok = 0; else seq = seq * 10ULL + (uint64_t)(ch - '0');
+        }
+        if (!ok)
+            return reply_error(fd, "ERR xadd failed");
+        if (ms == 0 && seq == 0)
+            return reply_error(fd, "ERR The ID specified in XADD must be greater than 0-0");
+    }
+
     size_t npairs = rem / 2;
     const char **fkeys = (const char **)calloc(npairs, sizeof(char *));
     const char **fvals = (const char **)calloc(npairs, sizeof(char *));
@@ -317,6 +344,10 @@ static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     free(fkeys); free(fvals); free(fklen); free(fvlen);
     if (rc != 0 && wrongtype)
         return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+    if (rc == -2)
+        return reply_error(fd, "ERR The ID specified in XADD must be greater than 0-0");
+    if (rc == -3)
+        return reply_error(fd, "ERR The ID specified in XADD is equal or smaller than the target stream top item");
     if (rc != 0)
         return reply_error(fd, "ERR xadd failed");
     return reply_bulk(fd, idptr, idsz);
