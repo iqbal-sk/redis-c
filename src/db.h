@@ -76,4 +76,6 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
                    const char **fkeys, const size_t *fklen,
                    const char **fvals, const size_t *fvlen,
                    size_t npairs,
-                   int *wrongtype);
+                   int *wrongtype,
+                   // Optional out params: point to the stored ID buffer for the new entry
+                   const char **out_id, size_t *out_idlen);

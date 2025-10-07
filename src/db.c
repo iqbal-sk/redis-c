@@ -243,14 +243,16 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
                    const char **fkeys, const size_t *fklen,
                    const char **fvals, const size_t *fvlen,
                    size_t npairs,
-                   int *wrongtype)
+                   int *wrongtype,
+                   const char **out_id, size_t *out_idlen)
 {
     if (wrongtype) *wrongtype = 0;
-    // Validate provided ID: explicit millisecond-seq format "<ms>-<seq>"
-    // Parse new id into two unsigned integers
-    uint64_t new_ms = 0, new_seq = 0;
+    if (out_id) *out_id = NULL;
+    if (out_idlen) *out_idlen = 0;
+    // Validate provided ID or auto sequence: format "<ms>-<seq|*>"
+    // Parse new id ms and seq (if explicit) or mark auto.
+    uint64_t new_ms = 0, new_seq = 0; int auto_seq = 0;
     {
-        // Find dash
         size_t dash = (size_t)-1;
         for (size_t i = 0; i < idlen; i++)
         {
@@ -258,25 +260,32 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
         }
         if (dash == (size_t)-1)
             return -1; // invalid format
-        // Parse ms
         if (dash == 0) return -1; // empty ms
+        // parse ms
         for (size_t i = 0; i < dash; i++)
         {
             char ch = id[i];
             if (ch < '0' || ch > '9') return -1;
             new_ms = new_ms * 10ULL + (uint64_t)(ch - '0');
         }
-        // Parse seq
+        // parse seq or '*'
         size_t seq_start = dash + 1;
-        if (seq_start >= idlen) return -1; // empty seq
-        for (size_t i = seq_start; i < idlen; i++)
+        if (seq_start >= idlen) return -1;
+        if (id[seq_start] == '*' && seq_start + 1 == idlen)
         {
-            char ch = id[i];
-            if (ch < '0' || ch > '9') return -1;
-            new_seq = new_seq * 10ULL + (uint64_t)(ch - '0');
+            auto_seq = 1;
         }
-        if (new_ms == 0 && new_seq == 0)
-            return -2; // must be greater than 0-0
+        else
+        {
+            for (size_t i = seq_start; i < idlen; i++)
+            {
+                char ch = id[i];
+                if (ch < '0' || ch > '9') return -1;
+                new_seq = new_seq * 10ULL + (uint64_t)(ch - '0');
+            }
+            if (new_ms == 0 && new_seq == 0)
+                return -2; // must be greater than 0-0
+        }
     }
     unsigned long b = 0; Entry *prev = NULL;
     Entry *e = db_find(db, key, klen, &b, &prev);
@@ -303,41 +312,65 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
         return -1;
     }
 
-    // If stream not empty, ensure new ID is strictly greater than last ID
+    // Compute/validate against last id if present
+    uint64_t last_ms = 0, last_seq = 0; int have_last = 0;
     if (e->data.stream.tail)
     {
-        // Parse last id
-        uint64_t last_ms = 0, last_seq = 0;
+        have_last = 1;
         const char *lid = e->data.stream.tail->id;
         size_t lidlen = e->data.stream.tail->idlen;
-        size_t dash = (size_t)-1;
-        for (size_t i = 0; i < lidlen; i++)
+        size_t dash = 0; while (dash < lidlen && lid[dash] != '-') dash++;
+        for (size_t i = 0; i < dash; i++) last_ms = last_ms * 10ULL + (uint64_t)(lid[i] - '0');
+        for (size_t i = dash + 1; i < lidlen; i++) last_seq = last_seq * 10ULL + (uint64_t)(lid[i] - '0');
+    }
+    if (!auto_seq)
+    {
+        if (have_last)
         {
-            if (lid[i] == '-') { dash = i; break; }
+            if (new_ms < last_ms || (new_ms == last_ms && new_seq <= last_seq))
+                return -3;
         }
-        if (dash != (size_t)-1 && dash > 0 && dash + 1 < lidlen)
+    }
+    else
+    {
+        if (have_last)
         {
-            for (size_t i = 0; i < dash; i++)
-            {
-                last_ms = last_ms * 10ULL + (uint64_t)(lid[i] - '0');
-            }
-            for (size_t i = dash + 1; i < lidlen; i++)
-            {
-                last_seq = last_seq * 10ULL + (uint64_t)(lid[i] - '0');
-            }
+            if (new_ms < last_ms)
+                return -3;
+            if (new_ms == last_ms)
+                new_seq = last_seq + 1;
+            else
+                new_seq = (new_ms == 0 ? 1 : 0);
         }
-        // Validate strictly greater than last
-        if (new_ms < last_ms || (new_ms == last_ms && new_seq <= last_seq))
-            return -3; // equal or smaller than top item
+        else
+        {
+            new_seq = (new_ms == 0 ? 1 : 0);
+        }
     }
 
     // Allocate new stream entry
     StreamEntry *se = (StreamEntry*)calloc(1, sizeof(StreamEntry));
     if (!se) return -1;
-    se->id = (char*)malloc(idlen);
-    if (!se->id && idlen > 0) { free(se); return -1; }
-    if (idlen > 0) memcpy(se->id, id, idlen);
-    se->idlen = idlen;
+    // Build stored ID buffer
+    if (auto_seq)
+    {
+        char tmp[64];
+        int n = snprintf(tmp, sizeof(tmp), "%llu-%llu",
+                         (unsigned long long)new_ms,
+                         (unsigned long long)new_seq);
+        if (n <= 0 || (size_t)n >= sizeof(tmp)) { free(se); return -1; }
+        se->idlen = (size_t)n;
+        se->id = (char*)malloc(se->idlen);
+        if (!se->id) { free(se); return -1; }
+        memcpy(se->id, tmp, se->idlen);
+    }
+    else
+    {
+        se->id = (char*)malloc(idlen);
+        if (!se->id && idlen > 0) { free(se); return -1; }
+        if (idlen > 0) memcpy(se->id, id, idlen);
+        se->idlen = idlen;
+    }
     se->fields = NULL; se->next = NULL;
 
     // Build fields list (in order)
@@ -370,6 +403,8 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
         e->data.stream.tail = se;
     }
     e->data.stream.len++;
+    if (out_id) *out_id = se->id;
+    if (out_idlen) *out_idlen = se->idlen;
     return 0;
 }
 
