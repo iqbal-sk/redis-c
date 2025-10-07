@@ -297,30 +297,39 @@ static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     if (rem < 2 || (rem % 2) != 0)
         return reply_error(fd, "ERR wrong number of arguments for 'XADD'");
 
-    // For this stage, only explicit IDs are supported: <ms>-<seq>
-    // Quick client-side validation for 0-0 to tailor error message early
+    // Validate ID format quickly to provide tailored errors;
+    // allow explicit (ms-seq) and auto-seq (ms-*) for this stage.
     {
         size_t dash = (size_t)-1;
         for (size_t i = 0; i < idsz; i++)
             if (idptr[i] == '-') { dash = i; break; }
         if (dash == (size_t)-1)
-            return reply_error(fd, "ERR xadd failed"); // generic invalid format
-        // Check numeric and detect 0-0 quickly
-        uint64_t ms = 0, seq = 0; int ok = 1;
+            return reply_error(fd, "ERR xadd failed");
+        uint64_t ms = 0, seq = 0; int ok = 1; int star = 0;
         if (dash == 0 || dash + 1 >= idsz) ok = 0;
         for (size_t i = 0; ok && i < dash; i++)
         {
             char ch = idptr[i];
             if (ch < '0' || ch > '9') ok = 0; else ms = ms * 10ULL + (uint64_t)(ch - '0');
         }
-        for (size_t i = dash + 1; ok && i < idsz; i++)
+        if (ok)
         {
-            char ch = idptr[i];
-            if (ch < '0' || ch > '9') ok = 0; else seq = seq * 10ULL + (uint64_t)(ch - '0');
+            if (dash + 1 == idsz - 1 && idptr[dash + 1] == '*')
+            {
+                star = 1;
+            }
+            else
+            {
+                for (size_t i = dash + 1; ok && i < idsz; i++)
+                {
+                    char ch = idptr[i];
+                    if (ch < '0' || ch > '9') ok = 0; else seq = seq * 10ULL + (uint64_t)(ch - '0');
+                }
+            }
         }
         if (!ok)
             return reply_error(fd, "ERR xadd failed");
-        if (ms == 0 && seq == 0)
+        if (!star && ms == 0 && seq == 0)
             return reply_error(fd, "ERR The ID specified in XADD must be greater than 0-0");
     }
 
@@ -340,7 +349,8 @@ static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
         fvals[i] = args[2 + i * 2 + 1].ptr; fvlen[i] = args[2 + i * 2 + 1].len;
     }
     int wrongtype = 0;
-    int rc = db_stream_xadd(db, kptr, ksz, idptr, idsz, fkeys, fklen, fvals, fvlen, npairs, &wrongtype);
+    const char *stored_id = NULL; size_t stored_id_len = 0;
+    int rc = db_stream_xadd(db, kptr, ksz, idptr, idsz, fkeys, fklen, fvals, fvlen, npairs, &wrongtype, &stored_id, &stored_id_len);
     free(fkeys); free(fvals); free(fklen); free(fvlen);
     if (rc != 0 && wrongtype)
         return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -350,7 +360,8 @@ static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
         return reply_error(fd, "ERR The ID specified in XADD is equal or smaller than the target stream top item");
     if (rc != 0)
         return reply_error(fd, "ERR xadd failed");
-    return reply_bulk(fd, idptr, idsz);
+    // Reply with the stored (possibly auto-generated) ID
+    return reply_bulk(fd, stored_id, stored_id_len);
 }
 
 typedef struct CmdDef
