@@ -367,6 +367,97 @@ static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     return reply_bulk(fd, stored_id, stored_id_len);
 }
 
+static int parse_stream_qid(const char *s, size_t len, uint64_t *ms, uint64_t *seq, int is_start)
+{
+    if (!s || len == 0 || !ms || !seq) return -1;
+    // Check for '-'
+    size_t dash = (size_t)-1;
+    for (size_t i = 0; i < len; i++)
+    {
+        if (s[i] == '-') { dash = i; break; }
+    }
+    if (dash == (size_t)-1)
+    {
+        // Only milliseconds part provided
+        uint64_t tms = 0; int any = 0;
+        for (size_t i = 0; i < len; i++)
+        {
+            char ch = s[i]; if (ch < '0' || ch > '9') return -1; any = 1; tms = tms * 10ULL + (uint64_t)(ch - '0');
+        }
+        if (!any) return -1;
+        *ms = tms;
+        *seq = is_start ? 0ULL : UINT64_MAX;
+        return 0;
+    }
+    if (dash == 0 || dash + 1 >= len) return -1;
+    uint64_t tms = 0, tseq = 0; int anyms = 0, anyseq = 0;
+    for (size_t i = 0; i < dash; i++)
+    {
+        char ch = s[i]; if (ch < '0' || ch > '9') return -1; anyms = 1; tms = tms * 10ULL + (uint64_t)(ch - '0');
+    }
+    for (size_t i = dash + 1; i < len; i++)
+    {
+        char ch = s[i]; if (ch < '0' || ch > '9') return -1; anyseq = 1; tseq = tseq * 10ULL + (uint64_t)(ch - '0');
+    }
+    if (!anyms || !anyseq) return -1;
+    *ms = tms; *seq = tseq; return 0;
+}
+
+static int emit_xrange_entry(void *ctx,
+                             const char *id, size_t idlen,
+                             const char **fkeys, const size_t *fklen,
+                             const char **fvals, const size_t *fvlen,
+                             size_t npairs)
+{
+    int fd = *(int*)ctx;
+    // Each entry is an array of 2 elements: id, fields array
+    if (reply_array_header(fd, 2) != 0) return -1;
+    if (reply_bulk(fd, id, idlen) != 0) return -1;
+    size_t fields_cnt = npairs * 2;
+    if (reply_array_header(fd, fields_cnt) != 0) return -1;
+    for (size_t i = 0; i < npairs; i++)
+    {
+        if (reply_bulk(fd, fkeys[i], fklen[i]) != 0) return -1;
+        if (reply_bulk(fd, fvals[i], fvlen[i]) != 0) return -1;
+    }
+    return 0;
+}
+
+static int handle_xrange(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs != 3)
+        return reply_error(fd, "ERR wrong number of arguments for 'XRANGE'");
+    uint64_t start_ms = 0, start_seq = 0, end_ms = 0, end_seq = 0;
+    if (parse_stream_qid(args[1].ptr, args[1].len, &start_ms, &start_seq, 1) != 0 ||
+        parse_stream_qid(args[2].ptr, args[2].len, &end_ms, &end_seq, 0) != 0)
+    {
+        return reply_error(fd, "ERR value is not an integer or out of range");
+    }
+    size_t cnt = 0; int wrongtype = 0;
+    if (db_stream_xrange_count(db, args[0].ptr, args[0].len,
+                               start_ms, start_seq, end_ms, end_seq,
+                               &cnt, &wrongtype) != 0)
+    {
+        if (wrongtype)
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        // else treat as empty
+        cnt = 0;
+    }
+    if (reply_array_header(fd, cnt) != 0) return -1;
+    if (cnt == 0) return 0;
+    int fd_ctx = fd; wrongtype = 0;
+    if (db_stream_xrange_emit(db, args[0].ptr, args[0].len,
+                              start_ms, start_seq, end_ms, end_seq,
+                              emit_xrange_entry, &fd_ctx, &wrongtype) != 0)
+    {
+        if (wrongtype)
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        return -1;
+    }
+    return 0;
+}
+
 typedef struct CmdDef
 {
     const char *name;
@@ -388,6 +479,7 @@ static const CmdDef kCmds[] = {
     {"LRANGE", 6, handle_lrange},
     // Streams
     {"XADD", 4, handle_xadd},
+    {"XRANGE", 6, handle_xrange},
 };
 
 static const CmdDef *find_cmd(const char *name, size_t nlen)
