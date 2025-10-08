@@ -249,9 +249,16 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
     if (wrongtype) *wrongtype = 0;
     if (out_id) *out_id = NULL;
     if (out_idlen) *out_idlen = 0;
-    // Validate provided ID or auto sequence: format "<ms>-<seq|*>"
-    // Parse new id ms and seq (if explicit) or mark auto.
-    uint64_t new_ms = 0, new_seq = 0; int auto_seq = 0;
+    // Validate provided ID or auto sequence/time: "*" or "<ms>-<seq|*>"
+    // Parse new id ms and seq (if explicit) or mark auto flags.
+    uint64_t new_ms = 0, new_seq = 0; int auto_seq = 0; int auto_all = 0;
+    if (idlen == 1 && id[0] == '*')
+    {
+        auto_all = 1;
+        new_ms = (uint64_t)now_ms();
+        new_seq = 0;
+    }
+    else
     {
         size_t dash = (size_t)-1;
         for (size_t i = 0; i < idlen; i++)
@@ -323,7 +330,7 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
         for (size_t i = 0; i < dash; i++) last_ms = last_ms * 10ULL + (uint64_t)(lid[i] - '0');
         for (size_t i = dash + 1; i < lidlen; i++) last_seq = last_seq * 10ULL + (uint64_t)(lid[i] - '0');
     }
-    if (!auto_seq)
+    if (!auto_seq && !auto_all)
     {
         if (have_last)
         {
@@ -331,7 +338,7 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
                 return -3;
         }
     }
-    else
+    else if (auto_seq)
     {
         if (have_last)
         {
@@ -347,12 +354,36 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
             new_seq = (new_ms == 0 ? 1 : 0);
         }
     }
+    else /* auto_all */
+    {
+        if (have_last)
+        {
+            if (new_ms < last_ms)
+            {
+                // keep monotonic order if clock went backwards
+                new_ms = last_ms;
+                new_seq = last_seq + 1;
+            }
+            else if (new_ms == last_ms)
+            {
+                new_seq = last_seq + 1;
+            }
+            else
+            {
+                new_seq = 0; // first seq for this millisecond
+            }
+        }
+        else
+        {
+            new_seq = 0; // empty stream, start at 0
+        }
+    }
 
     // Allocate new stream entry
     StreamEntry *se = (StreamEntry*)calloc(1, sizeof(StreamEntry));
     if (!se) return -1;
     // Build stored ID buffer
-    if (auto_seq)
+    if (auto_seq || auto_all)
     {
         char tmp[64];
         int n = snprintf(tmp, sizeof(tmp), "%llu-%llu",

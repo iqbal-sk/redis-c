@@ -298,39 +298,42 @@ static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
         return reply_error(fd, "ERR wrong number of arguments for 'XADD'");
 
     // Validate ID format quickly to provide tailored errors;
-    // allow explicit (ms-seq) and auto-seq (ms-*) for this stage.
+    // allow explicit (ms-seq), auto-seq (ms-*), and full auto (*).
     {
-        size_t dash = (size_t)-1;
-        for (size_t i = 0; i < idsz; i++)
-            if (idptr[i] == '-') { dash = i; break; }
-        if (dash == (size_t)-1)
-            return reply_error(fd, "ERR xadd failed");
-        uint64_t ms = 0, seq = 0; int ok = 1; int star = 0;
-        if (dash == 0 || dash + 1 >= idsz) ok = 0;
-        for (size_t i = 0; ok && i < dash; i++)
+        if (!(idsz == 1 && idptr[0] == '*'))
         {
-            char ch = idptr[i];
-            if (ch < '0' || ch > '9') ok = 0; else ms = ms * 10ULL + (uint64_t)(ch - '0');
-        }
-        if (ok)
-        {
-            if (dash + 1 == idsz - 1 && idptr[dash + 1] == '*')
+            size_t dash = (size_t)-1;
+            for (size_t i = 0; i < idsz; i++)
+                if (idptr[i] == '-') { dash = i; break; }
+            if (dash == (size_t)-1)
+                return reply_error(fd, "ERR xadd failed");
+            uint64_t ms = 0, seq = 0; int ok = 1; int star = 0;
+            if (dash == 0 || dash + 1 >= idsz) ok = 0;
+            for (size_t i = 0; ok && i < dash; i++)
             {
-                star = 1;
+                char ch = idptr[i];
+                if (ch < '0' || ch > '9') ok = 0; else ms = ms * 10ULL + (uint64_t)(ch - '0');
             }
-            else
+            if (ok)
             {
-                for (size_t i = dash + 1; ok && i < idsz; i++)
+                if (dash + 1 == idsz - 1 && idptr[dash + 1] == '*')
                 {
-                    char ch = idptr[i];
-                    if (ch < '0' || ch > '9') ok = 0; else seq = seq * 10ULL + (uint64_t)(ch - '0');
+                    star = 1;
+                }
+                else
+                {
+                    for (size_t i = dash + 1; ok && i < idsz; i++)
+                    {
+                        char ch = idptr[i];
+                        if (ch < '0' || ch > '9') ok = 0; else seq = seq * 10ULL + (uint64_t)(ch - '0');
+                    }
                 }
             }
+            if (!ok)
+                return reply_error(fd, "ERR xadd failed");
+            if (!star && ms == 0 && seq == 0)
+                return reply_error(fd, "ERR The ID specified in XADD must be greater than 0-0");
         }
-        if (!ok)
-            return reply_error(fd, "ERR xadd failed");
-        if (!star && ms == 0 && seq == 0)
-            return reply_error(fd, "ERR The ID specified in XADD must be greater than 0-0");
     }
 
     size_t npairs = rem / 2;
