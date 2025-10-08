@@ -439,6 +439,118 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
     return 0;
 }
 
+static int parse_id_bytes(const char *id, size_t idlen, uint64_t *ms, uint64_t *seq)
+{
+    size_t dash = (size_t)-1;
+    for (size_t i = 0; i < idlen; i++)
+        if (id[i] == '-') { dash = i; break; }
+    if (dash == (size_t)-1 || dash == 0 || dash + 1 >= idlen) return -1;
+    uint64_t tms = 0, tseq = 0;
+    for (size_t i = 0; i < dash; i++)
+    {
+        char ch = id[i]; if (ch < '0' || ch > '9') return -1; tms = tms * 10ULL + (uint64_t)(ch - '0');
+    }
+    for (size_t i = dash + 1; i < idlen; i++)
+    {
+        char ch = id[i]; if (ch < '0' || ch > '9') return -1; tseq = tseq * 10ULL + (uint64_t)(ch - '0');
+    }
+    if (ms) *ms = tms; if (seq) *seq = tseq; return 0;
+}
+
+static int id_le(uint64_t ams, uint64_t aseq, uint64_t bms, uint64_t bseq)
+{
+    return (ams < bms) || (ams == bms && aseq <= bseq);
+}
+
+int db_stream_xrange_count(DB *db, const char *key, size_t klen,
+                           uint64_t start_ms, uint64_t start_seq,
+                           uint64_t end_ms, uint64_t end_seq,
+                           size_t *out_n, int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    if (out_n) *out_n = 0;
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e)
+        return 0;
+    if (e->type != OBJ_STREAM)
+    {
+        if (wrongtype) *wrongtype = 1;
+        return -1;
+    }
+    if ((end_ms < start_ms) || (end_ms == start_ms && end_seq < start_seq))
+    {
+        if (out_n) *out_n = 0; return 0;
+    }
+    size_t cnt = 0;
+    for (struct StreamEntry *se = e->data.stream.head; se; se = se->next)
+    {
+        uint64_t ms = 0, sq = 0;
+        if (parse_id_bytes(se->id, se->idlen, &ms, &sq) != 0)
+            continue;
+        if (!id_le(ms, sq, end_ms, end_seq))
+            break; // since IDs are increasing
+        if (id_le(start_ms, start_seq, ms, sq))
+            cnt++;
+    }
+    if (out_n) *out_n = cnt;
+    return 0;
+}
+
+int db_stream_xrange_emit(DB *db, const char *key, size_t klen,
+                          uint64_t start_ms, uint64_t start_seq,
+                          uint64_t end_ms, uint64_t end_seq,
+                          db_stream_emit_cb emit, void *ctx,
+                          int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e) return 0;
+    if (e->type != OBJ_STREAM)
+    {
+        if (wrongtype) *wrongtype = 1; return -1;
+    }
+    if (!emit) return 0;
+    for (struct StreamEntry *se = e->data.stream.head; se; se = se->next)
+    {
+        uint64_t ms = 0, sq = 0;
+        if (parse_id_bytes(se->id, se->idlen, &ms, &sq) != 0)
+            continue;
+        if (!id_le(ms, sq, end_ms, end_seq))
+            break;
+        if (!id_le(start_ms, start_seq, ms, sq))
+            continue;
+        // Count fields
+        size_t npairs = 0; struct StreamField *f;
+        for (f = se->fields; f; f = f->next) npairs++;
+        // Build pointer arrays
+        const char **fkeys = NULL, **fvals = NULL;
+        size_t *fklen = NULL, *fvlen = NULL;
+        if (npairs > 0)
+        {
+            fkeys = (const char**)calloc(npairs, sizeof(char*));
+            fvals = (const char**)calloc(npairs, sizeof(char*));
+            fklen = (size_t*)calloc(npairs, sizeof(size_t));
+            fvlen = (size_t*)calloc(npairs, sizeof(size_t));
+            if (!fkeys || !fvals || !fklen || !fvlen)
+            {
+                free(fkeys); free(fvals); free(fklen); free(fvlen);
+                return -1;
+            }
+            size_t i = 0; for (f = se->fields; f; f = f->next)
+            {
+                fkeys[i] = f->key; fklen[i] = f->klen;
+                fvals[i] = f->val; fvlen[i] = f->vlen; i++;
+            }
+        }
+        int rc = emit(ctx, se->id, se->idlen, fkeys, fklen, fvals, fvlen, npairs);
+        free(fkeys); free(fvals); free(fklen); free(fvlen);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
 int db_type(DB *db, const char *key, size_t klen, ObjType *out_type, int *found)
 {
     if (found) *found = 0;

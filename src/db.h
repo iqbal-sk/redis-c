@@ -79,3 +79,19 @@ int db_stream_xadd(DB *db, const char *key, size_t klen,
                    int *wrongtype,
                    // Optional out params: point to the stored ID buffer for the new entry
                    const char **out_id, size_t *out_idlen);
+
+// Streams read helpers (XRANGE)
+typedef int (*db_stream_emit_cb)(void *ctx,
+                                 const char *id, size_t idlen,
+                                 const char **fkeys, const size_t *fklen,
+                                 const char **fvals, const size_t *fvlen,
+                                 size_t npairs);
+int db_stream_xrange_count(DB *db, const char *key, size_t klen,
+                           uint64_t start_ms, uint64_t start_seq,
+                           uint64_t end_ms, uint64_t end_seq,
+                           size_t *out_n, int *wrongtype);
+int db_stream_xrange_emit(DB *db, const char *key, size_t klen,
+                          uint64_t start_ms, uint64_t start_seq,
+                          uint64_t end_ms, uint64_t end_seq,
+                          db_stream_emit_cb emit, void *ctx,
+                          int *wrongtype);
