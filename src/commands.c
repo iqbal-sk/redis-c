@@ -370,6 +370,12 @@ static int handle_xadd(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 static int parse_stream_qid(const char *s, size_t len, uint64_t *ms, uint64_t *seq, int is_start)
 {
     if (!s || len == 0 || !ms || !seq) return -1;
+    // Special case: '-' denotes the beginning of the stream, valid only for start
+    if (len == 1 && s[0] == '-')
+    {
+        if (!is_start) return -1;
+        *ms = 0; *seq = 0; return 0;
+    }
     // Check for '-'
     size_t dash = (size_t)-1;
     for (size_t i = 0; i < len; i++)
