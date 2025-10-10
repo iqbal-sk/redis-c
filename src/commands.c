@@ -376,6 +376,12 @@ static int parse_stream_qid(const char *s, size_t len, uint64_t *ms, uint64_t *s
         if (!is_start) return -1;
         *ms = 0; *seq = 0; return 0;
     }
+    // Special case: '+' denotes the end of the stream, valid only for end
+    if (len == 1 && s[0] == '+')
+    {
+        if (is_start) return -1;
+        *ms = UINT64_MAX; *seq = UINT64_MAX; return 0;
+    }
     // Check for '-'
     size_t dash = (size_t)-1;
     for (size_t i = 0; i < len; i++)
