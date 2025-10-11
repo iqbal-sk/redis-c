@@ -473,81 +473,111 @@ static int handle_xrange(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 static int handle_xread(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
-    // XREAD STREAMS <key> <id>
-    if (nargs != 3)
+    // XREAD STREAMS <k1> [<k2> ...] <id1> [<id2> ...]
+    if (nargs < 3)
         return reply_error(fd, "ERR wrong number of arguments for 'XREAD'");
     if (!(args[0].len == 7 && ascii_casecmp_n(args[0].ptr, "STREAMS", 7) == 0))
         return reply_error(fd, "ERR syntax error");
-
-    const char *kptr = args[1].ptr; size_t klen = args[1].len;
-    // Parse exclusive start id (must be ms-seq)
-    uint64_t ms = 0, seq = 0;
+    size_t rem = nargs - 1;
+    if (rem < 2 || (rem % 2) != 0)
+        return reply_error(fd, "ERR wrong number of arguments for 'XREAD'");
+    size_t nkeys = rem / 2;
+    // Prepare outputs: count entries per stream, and inclusive start ids
+    uint64_t *s_ms = (uint64_t*)calloc(nkeys, sizeof(uint64_t));
+    uint64_t *s_seq = (uint64_t*)calloc(nkeys, sizeof(uint64_t));
+    size_t *counts = (size_t*)calloc(nkeys, sizeof(size_t));
+    if (!s_ms || !s_seq || !counts)
     {
-        // Require full id with dash
-        size_t dash = (size_t)-1;
-        for (size_t i = 0; i < args[2].len; i++)
-            if (args[2].ptr[i] == '-') { dash = i; break; }
-        if (dash == (size_t)-1 || dash == 0 || dash + 1 >= args[2].len)
-            return reply_error(fd, "ERR value is not an integer or out of range");
-        // parse ms
-        for (size_t i = 0; i < dash; i++)
-        {
-            char ch = args[2].ptr[i];
-            if (ch < '0' || ch > '9') return reply_error(fd, "ERR value is not an integer or out of range");
-            ms = ms * 10ULL + (uint64_t)(ch - '0');
-        }
-        for (size_t i = dash + 1; i < args[2].len; i++)
-        {
-            char ch = args[2].ptr[i];
-            if (ch < '0' || ch > '9') return reply_error(fd, "ERR value is not an integer or out of range");
-            seq = seq * 10ULL + (uint64_t)(ch - '0');
-        }
-    }
-    // Convert exclusive start (ms,seq) to inclusive start for XRANGE helpers
-    uint64_t start_ms = ms, start_seq = seq;
-    if (start_seq < UINT64_MAX)
-        start_seq++;
-    else
-    {
-        // Move to the next millisecond, if possible
-        if (start_ms == UINT64_MAX)
-        {
-            // No possible entries greater than this id
-            return reply_null_array(fd);
-        }
-        start_ms += 1;
-        start_seq = 0;
-    }
-
-    int wrongtype = 0;
-    size_t cnt = 0;
-    if (db_stream_xrange_count(db, kptr, klen,
-                               start_ms, start_seq,
-                               UINT64_MAX, UINT64_MAX,
-                               &cnt, &wrongtype) != 0)
-    {
-        if (wrongtype)
-            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
-        cnt = 0;
-    }
-    if (cnt == 0)
-        return reply_null_array(fd);
-    // Outer array of streams (1 stream)
-    if (reply_array_header(fd, 1) != 0) return -1;
-    // Stream array: [ key, entries ]
-    if (reply_array_header(fd, 2) != 0) return -1;
-    if (reply_bulk(fd, kptr, klen) != 0) return -1;
-    if (reply_array_header(fd, cnt) != 0) return -1;
-    int fd_ctx = fd; wrongtype = 0;
-    if (db_stream_xrange_emit(db, kptr, klen,
-                              start_ms, start_seq,
-                              UINT64_MAX, UINT64_MAX,
-                              emit_xrange_entry, &fd_ctx, &wrongtype) != 0)
-    {
-        if (wrongtype)
-            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        free(s_ms); free(s_seq); free(counts);
         return -1;
     }
+    // Parse each id and convert exclusive -> inclusive
+    for (size_t i = 0; i < nkeys; i++)
+    {
+        const Arg *idarg = &args[1 + nkeys + i];
+        uint64_t ms = 0, seq = 0;
+        size_t dash = (size_t)-1;
+        for (size_t j = 0; j < idarg->len; j++)
+            if (idarg->ptr[j] == '-') { dash = j; break; }
+        if (dash == (size_t)-1 || dash == 0 || dash + 1 >= idarg->len)
+        {
+            free(s_ms); free(s_seq); free(counts);
+            return reply_error(fd, "ERR value is not an integer or out of range");
+        }
+        for (size_t j = 0; j < dash; j++)
+        {
+            char ch = idarg->ptr[j];
+            if (ch < '0' || ch > '9') { free(s_ms); free(s_seq); free(counts); return reply_error(fd, "ERR value is not an integer or out of range"); }
+            ms = ms * 10ULL + (uint64_t)(ch - '0');
+        }
+        for (size_t j = dash + 1; j < idarg->len; j++)
+        {
+            char ch = idarg->ptr[j];
+            if (ch < '0' || ch > '9') { free(s_ms); free(s_seq); free(counts); return reply_error(fd, "ERR value is not an integer or out of range"); }
+            seq = seq * 10ULL + (uint64_t)(ch - '0');
+        }
+        // exclusive -> inclusive
+        if (seq < UINT64_MAX)
+        {
+            s_ms[i] = ms;
+            s_seq[i] = seq + 1;
+        }
+        else
+        {
+            if (ms == UINT64_MAX)
+            {
+                s_ms[i] = UINT64_MAX; s_seq[i] = UINT64_MAX; // no possible entries
+            }
+            else
+            {
+                s_ms[i] = ms + 1; s_seq[i] = 0;
+            }
+        }
+    }
+    // Count entries for each stream
+    int wrongtype = 0; size_t total_streams = 0;
+    for (size_t i = 0; i < nkeys; i++)
+    {
+        const Arg *karg = &args[1 + i];
+        size_t cnt = 0; wrongtype = 0;
+        if (db_stream_xrange_count(db, karg->ptr, karg->len,
+                                   s_ms[i], s_seq[i],
+                                   UINT64_MAX, UINT64_MAX,
+                                   &cnt, &wrongtype) != 0)
+        {
+            if (wrongtype) { free(s_ms); free(s_seq); free(counts); return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value"); }
+            cnt = 0;
+        }
+        counts[i] = cnt;
+        if (cnt > 0) total_streams++;
+    }
+    if (total_streams == 0)
+    {
+        free(s_ms); free(s_seq); free(counts);
+        return reply_null_array(fd);
+    }
+    // Outer array: only streams that have results, in the same order
+    if (reply_array_header(fd, total_streams) != 0) { free(s_ms); free(s_seq); free(counts); return -1; }
+    for (size_t i = 0; i < nkeys; i++)
+    {
+        if (counts[i] == 0) continue;
+        const Arg *karg = &args[1 + i];
+        if (reply_array_header(fd, 2) != 0) { free(s_ms); free(s_seq); free(counts); return -1; }
+        if (reply_bulk(fd, karg->ptr, karg->len) != 0) { free(s_ms); free(s_seq); free(counts); return -1; }
+        if (reply_array_header(fd, counts[i]) != 0) { free(s_ms); free(s_seq); free(counts); return -1; }
+        int fd_ctx = fd; wrongtype = 0;
+        if (db_stream_xrange_emit(db, karg->ptr, karg->len,
+                                  s_ms[i], s_seq[i],
+                                  UINT64_MAX, UINT64_MAX,
+                                  emit_xrange_entry, &fd_ctx, &wrongtype) != 0)
+        {
+            free(s_ms); free(s_seq); free(counts);
+            if (wrongtype)
+                return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+            return -1;
+        }
+    }
+    free(s_ms); free(s_seq); free(counts);
     return 0;
 }
 typedef struct CmdDef
