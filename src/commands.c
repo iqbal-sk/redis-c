@@ -470,6 +470,86 @@ static int handle_xrange(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     return 0;
 }
 
+static int handle_xread(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    // XREAD STREAMS <key> <id>
+    if (nargs != 3)
+        return reply_error(fd, "ERR wrong number of arguments for 'XREAD'");
+    if (!(args[0].len == 7 && ascii_casecmp_n(args[0].ptr, "STREAMS", 7) == 0))
+        return reply_error(fd, "ERR syntax error");
+
+    const char *kptr = args[1].ptr; size_t klen = args[1].len;
+    // Parse exclusive start id (must be ms-seq)
+    uint64_t ms = 0, seq = 0;
+    {
+        // Require full id with dash
+        size_t dash = (size_t)-1;
+        for (size_t i = 0; i < args[2].len; i++)
+            if (args[2].ptr[i] == '-') { dash = i; break; }
+        if (dash == (size_t)-1 || dash == 0 || dash + 1 >= args[2].len)
+            return reply_error(fd, "ERR value is not an integer or out of range");
+        // parse ms
+        for (size_t i = 0; i < dash; i++)
+        {
+            char ch = args[2].ptr[i];
+            if (ch < '0' || ch > '9') return reply_error(fd, "ERR value is not an integer or out of range");
+            ms = ms * 10ULL + (uint64_t)(ch - '0');
+        }
+        for (size_t i = dash + 1; i < args[2].len; i++)
+        {
+            char ch = args[2].ptr[i];
+            if (ch < '0' || ch > '9') return reply_error(fd, "ERR value is not an integer or out of range");
+            seq = seq * 10ULL + (uint64_t)(ch - '0');
+        }
+    }
+    // Convert exclusive start (ms,seq) to inclusive start for XRANGE helpers
+    uint64_t start_ms = ms, start_seq = seq;
+    if (start_seq < UINT64_MAX)
+        start_seq++;
+    else
+    {
+        // Move to the next millisecond, if possible
+        if (start_ms == UINT64_MAX)
+        {
+            // No possible entries greater than this id
+            return reply_null_array(fd);
+        }
+        start_ms += 1;
+        start_seq = 0;
+    }
+
+    int wrongtype = 0;
+    size_t cnt = 0;
+    if (db_stream_xrange_count(db, kptr, klen,
+                               start_ms, start_seq,
+                               UINT64_MAX, UINT64_MAX,
+                               &cnt, &wrongtype) != 0)
+    {
+        if (wrongtype)
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        cnt = 0;
+    }
+    if (cnt == 0)
+        return reply_null_array(fd);
+    // Outer array of streams (1 stream)
+    if (reply_array_header(fd, 1) != 0) return -1;
+    // Stream array: [ key, entries ]
+    if (reply_array_header(fd, 2) != 0) return -1;
+    if (reply_bulk(fd, kptr, klen) != 0) return -1;
+    if (reply_array_header(fd, cnt) != 0) return -1;
+    int fd_ctx = fd; wrongtype = 0;
+    if (db_stream_xrange_emit(db, kptr, klen,
+                              start_ms, start_seq,
+                              UINT64_MAX, UINT64_MAX,
+                              emit_xrange_entry, &fd_ctx, &wrongtype) != 0)
+    {
+        if (wrongtype)
+            return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+        return -1;
+    }
+    return 0;
+}
 typedef struct CmdDef
 {
     const char *name;
@@ -492,6 +572,7 @@ static const CmdDef kCmds[] = {
     // Streams
     {"XADD", 4, handle_xadd},
     {"XRANGE", 6, handle_xrange},
+    {"XREAD", 5, handle_xread},
 };
 
 static const CmdDef *find_cmd(const char *name, size_t nlen)
