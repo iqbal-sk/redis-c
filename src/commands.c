@@ -473,12 +473,22 @@ static int handle_xrange(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 static int handle_xread(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
-    // XREAD STREAMS <k1> [<k2> ...] <id1> [<id2> ...]
+    // XREAD [BLOCK ms] STREAMS <k1> [<k2> ...] <id1> [<id2> ...]
     if (nargs < 3)
         return reply_error(fd, "ERR wrong number of arguments for 'XREAD'");
-    if (!(args[0].len == 7 && ascii_casecmp_n(args[0].ptr, "STREAMS", 7) == 0))
+    size_t idx = 0;
+    int do_block = 0; int64_t block_ms = 0;
+    if (args[idx].len == 5 && ascii_casecmp_n(args[idx].ptr, "BLOCK", 5) == 0)
+    {
+        if (nargs < 5) return reply_error(fd, "ERR wrong number of arguments for 'XREAD'");
+        int64_t msval = 0;
+        if (parse_i64_ascii(args[idx+1].ptr, args[idx+1].len, &msval) != 0 || msval < 0)
+            return reply_error(fd, "ERR value is not an integer or out of range");
+        do_block = 1; block_ms = msval; idx += 2;
+    }
+    if (!(args[idx].len == 7 && ascii_casecmp_n(args[idx].ptr, "STREAMS", 7) == 0))
         return reply_error(fd, "ERR syntax error");
-    size_t rem = nargs - 1;
+    size_t rem = nargs - (idx + 1);
     if (rem < 2 || (rem % 2) != 0)
         return reply_error(fd, "ERR wrong number of arguments for 'XREAD'");
     size_t nkeys = rem / 2;
@@ -494,7 +504,7 @@ static int handle_xread(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     // Parse each id and convert exclusive -> inclusive
     for (size_t i = 0; i < nkeys; i++)
     {
-        const Arg *idarg = &args[1 + nkeys + i];
+        const Arg *idarg = &args[idx + 1 + nkeys + i];
         uint64_t ms = 0, seq = 0;
         size_t dash = (size_t)-1;
         for (size_t j = 0; j < idarg->len; j++)
@@ -538,7 +548,7 @@ static int handle_xread(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     int wrongtype = 0; size_t total_streams = 0;
     for (size_t i = 0; i < nkeys; i++)
     {
-        const Arg *karg = &args[1 + i];
+        const Arg *karg = &args[idx + 1 + i];
         size_t cnt = 0; wrongtype = 0;
         if (db_stream_xrange_count(db, karg->ptr, karg->len,
                                    s_ms[i], s_seq[i],
@@ -553,15 +563,30 @@ static int handle_xread(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     }
     if (total_streams == 0)
     {
+        if (!do_block)
+        {
+            free(s_ms); free(s_seq); free(counts);
+            return reply_null_array(fd);
+        }
+        // Register waiters for each stream, then return without replying. Timeout => null array.
+        int64_t deadline = (block_ms == 0) ? 0 : (now_ms() + block_ms);
+        if (g_srv)
+        {
+            for (size_t i = 0; i < nkeys; i++)
+            {
+                const Arg *karg = &args[idx + 1 + i];
+                server_add_stream_waiter(g_srv, c, fd, karg->ptr, karg->len, s_ms[i], s_seq[i], deadline);
+            }
+        }
         free(s_ms); free(s_seq); free(counts);
-        return reply_null_array(fd);
+        return 0;
     }
     // Outer array: only streams that have results, in the same order
     if (reply_array_header(fd, total_streams) != 0) { free(s_ms); free(s_seq); free(counts); return -1; }
     for (size_t i = 0; i < nkeys; i++)
     {
         if (counts[i] == 0) continue;
-        const Arg *karg = &args[1 + i];
+        const Arg *karg = &args[idx + 1 + i];
         if (reply_array_header(fd, 2) != 0) { free(s_ms); free(s_seq); free(counts); return -1; }
         if (reply_bulk(fd, karg->ptr, karg->len) != 0) { free(s_ms); free(s_seq); free(counts); return -1; }
         if (reply_array_header(fd, counts[i]) != 0) { free(s_ms); free(s_seq); free(counts); return -1; }
