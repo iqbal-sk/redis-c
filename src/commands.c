@@ -501,46 +501,66 @@ static int handle_xread(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
         free(s_ms); free(s_seq); free(counts);
         return -1;
     }
-    // Parse each id and convert exclusive -> inclusive
+    // Parse each id and convert exclusive -> inclusive. Support "$" meaning last ID at call time.
     for (size_t i = 0; i < nkeys; i++)
     {
         const Arg *idarg = &args[idx + 1 + nkeys + i];
-        uint64_t ms = 0, seq = 0;
-        size_t dash = (size_t)-1;
-        for (size_t j = 0; j < idarg->len; j++)
-            if (idarg->ptr[j] == '-') { dash = j; break; }
-        if (dash == (size_t)-1 || dash == 0 || dash + 1 >= idarg->len)
+        if (idarg->len == 1 && idarg->ptr[0] == '$')
         {
-            free(s_ms); free(s_seq); free(counts);
-            return reply_error(fd, "ERR value is not an integer or out of range");
-        }
-        for (size_t j = 0; j < dash; j++)
-        {
-            char ch = idarg->ptr[j];
-            if (ch < '0' || ch > '9') { free(s_ms); free(s_seq); free(counts); return reply_error(fd, "ERR value is not an integer or out of range"); }
-            ms = ms * 10ULL + (uint64_t)(ch - '0');
-        }
-        for (size_t j = dash + 1; j < idarg->len; j++)
-        {
-            char ch = idarg->ptr[j];
-            if (ch < '0' || ch > '9') { free(s_ms); free(s_seq); free(counts); return reply_error(fd, "ERR value is not an integer or out of range"); }
-            seq = seq * 10ULL + (uint64_t)(ch - '0');
-        }
-        // exclusive -> inclusive
-        if (seq < UINT64_MAX)
-        {
-            s_ms[i] = ms;
-            s_seq[i] = seq + 1;
-        }
-        else
-        {
-            if (ms == UINT64_MAX)
+            // Resolve to last id at this moment
+            uint64_t last_ms = 0, last_seq = 0; int found = 0; int wrongtype2 = 0;
+            const Arg *karg = &args[idx + 1 + i];
+            if (db_stream_last_id(db, karg->ptr, karg->len, &last_ms, &last_seq, &found, &wrongtype2) != 0)
             {
-                s_ms[i] = UINT64_MAX; s_seq[i] = UINT64_MAX; // no possible entries
+                free(s_ms); free(s_seq); free(counts);
+                if (wrongtype2)
+                    return reply_error(fd, "WRONGTYPE Operation against a key holding the wrong kind of value");
+                return reply_error(fd, "ERR xread failed");
+            }
+            // exclusive -> inclusive after last id
+            if (found)
+            {
+                if (last_seq < UINT64_MAX) { s_ms[i] = last_ms; s_seq[i] = last_seq + 1; }
+                else { s_ms[i] = (last_ms == UINT64_MAX) ? UINT64_MAX : (last_ms + 1); s_seq[i] = 0; }
             }
             else
             {
-                s_ms[i] = ms + 1; s_seq[i] = 0;
+                // empty stream: start after 0-0
+                s_ms[i] = 0; s_seq[i] = 1;
+            }
+        }
+        else
+        {
+            uint64_t ms = 0, seq = 0;
+            size_t dash = (size_t)-1;
+            for (size_t j = 0; j < idarg->len; j++)
+                if (idarg->ptr[j] == '-') { dash = j; break; }
+            if (dash == (size_t)-1 || dash == 0 || dash + 1 >= idarg->len)
+            {
+                free(s_ms); free(s_seq); free(counts);
+                return reply_error(fd, "ERR value is not an integer or out of range");
+            }
+            for (size_t j = 0; j < dash; j++)
+            {
+                char ch = idarg->ptr[j];
+                if (ch < '0' || ch > '9') { free(s_ms); free(s_seq); free(counts); return reply_error(fd, "ERR value is not an integer or out of range"); }
+                ms = ms * 10ULL + (uint64_t)(ch - '0');
+            }
+            for (size_t j = dash + 1; j < idarg->len; j++)
+            {
+                char ch = idarg->ptr[j];
+                if (ch < '0' || ch > '9') { free(s_ms); free(s_seq); free(counts); return reply_error(fd, "ERR value is not an integer or out of range"); }
+                seq = seq * 10ULL + (uint64_t)(ch - '0');
+            }
+            // exclusive -> inclusive
+            if (seq < UINT64_MAX)
+            {
+                s_ms[i] = ms; s_seq[i] = seq + 1;
+            }
+            else
+            {
+                s_ms[i] = (ms == UINT64_MAX) ? UINT64_MAX : (ms + 1);
+                s_seq[i] = 0;
             }
         }
     }
