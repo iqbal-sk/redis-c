@@ -6,6 +6,24 @@
 #include "server.h"
 #include "resp.h"
 
+typedef struct EmitCtx { int fd; } EmitCtx;
+static int emit_xrange_entry_cb(void *ctx,
+                                const char *id, size_t idlen,
+                                const char **fkeys, const size_t *fklen,
+                                const char **fvals, const size_t *fvlen,
+                                size_t npairs)
+{
+    int fd = ((EmitCtx*)ctx)->fd;
+    if (reply_array_header(fd, 2) != 0) return -1;
+    if (reply_bulk(fd, id, idlen) != 0) return -1;
+    if (reply_array_header(fd, npairs * 2) != 0) return -1;
+    for (size_t i = 0; i < npairs; i++)
+    {
+        if (reply_bulk(fd, fkeys[i], fklen[i]) != 0) return -1;
+        if (reply_bulk(fd, fvals[i], fvlen[i]) != 0) return -1;
+    }
+    return 0;
+}
 int server_listen(Server *srv, int port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -172,9 +190,37 @@ void server_add_waiter(Server *srv, Conn *c, int fd, const char *key, size_t kle
     if (klen > 0) memcpy(w->key, key, klen);
     w->klen = klen;
     w->deadline_ms = deadline_ms;
+    w->type = WAIT_LIST_BLPOP;
     w->next = NULL;
 
     // append to tail to preserve FIFO across all waiters
+    if (!srv->waiters)
+        srv->waiters = w;
+    else
+    {
+        BlockedWaiter *t = srv->waiters;
+        while (t->next) t = t->next;
+        t->next = w;
+    }
+    if (c) c->blocked = 1;
+}
+
+void server_add_stream_waiter(Server *srv, Conn *c, int fd, const char *key, size_t klen,
+                              uint64_t start_ms, uint64_t start_seq, int64_t deadline_ms)
+{
+    if (!srv) return;
+    BlockedWaiter *w = (BlockedWaiter *)calloc(1, sizeof(BlockedWaiter));
+    if (!w) return;
+    w->fd = fd;
+    w->key = (char *)malloc(klen);
+    if (!w->key && klen > 0) { free(w); return; }
+    if (klen > 0) memcpy(w->key, key, klen);
+    w->klen = klen;
+    w->deadline_ms = deadline_ms;
+    w->type = WAIT_STREAM_XREAD;
+    w->start_ms = start_ms; w->start_seq = start_seq;
+    w->next = NULL;
+
     if (!srv->waiters)
         srv->waiters = w;
     else
@@ -233,27 +279,71 @@ void server_serve_waiters(Server *srv, Conn *conns)
     BlockedWaiter *cur = srv->waiters;
     while (cur)
     {
-        int wrongtype = 0;
-        char *v = NULL; size_t vlen = 0;
-        int rc = db_list_lpop(&srv->db, cur->key, cur->klen, &v, &vlen, &wrongtype);
-        if (rc == 0 && v)
+        if (cur->type == WAIT_LIST_BLPOP)
         {
-            // we have a value, send to client and remove waiter
-            if (send_bulk_pair(cur->fd, cur->key, cur->klen, v, vlen) != 0)
+            int wrongtype = 0;
+            char *v = NULL; size_t vlen = 0;
+            int rc = db_list_lpop(&srv->db, cur->key, cur->klen, &v, &vlen, &wrongtype);
+            if (rc == 0 && v)
             {
-                // on send failure, close connection from our side
-                // Not closing fd here; event loop will detect on next read
+                if (send_bulk_pair(cur->fd, cur->key, cur->klen, v, vlen) != 0)
+                {
+                    // ignore send error
+                }
+                free(v);
+                if (conns) conns[cur->fd].blocked = 0;
+                BlockedWaiter *to_del = cur;
+                cur = cur->next;
+                if (prev) prev->next = cur; else srv->waiters = cur;
+                free(to_del->key); free(to_del);
+                continue;
             }
-            free(v);
-            if (conns) conns[cur->fd].blocked = 0;
-            BlockedWaiter *to_del = cur;
-            cur = cur->next;
-            if (prev) prev->next = cur; else srv->waiters = cur;
-            free(to_del->key); free(to_del);
-            continue;
+            prev = cur; cur = cur->next;
         }
-        // leave waiter in place if list empty/missing or wrong type
-        prev = cur; cur = cur->next;
+        else if (cur->type == WAIT_STREAM_XREAD)
+        {
+            // See if any entries available strictly greater than the provided id (inclusive start already computed)
+            size_t cnt = 0; int wrongtype = 0;
+            if (db_stream_xrange_count(&srv->db, cur->key, cur->klen,
+                                       cur->start_ms, cur->start_seq,
+                                       UINT64_MAX, UINT64_MAX,
+                                       &cnt, &wrongtype) != 0)
+            {
+                // wrongtype or error: treat as not ready
+                prev = cur; cur = cur->next; continue;
+            }
+            if (cnt > 0)
+            {
+                // Prepare response: array of 1 stream
+                if (reply_array_header(cur->fd, 1) == 0 &&
+                    reply_array_header(cur->fd, 2) == 0 &&
+                    reply_bulk(cur->fd, cur->key, cur->klen) == 0 &&
+                    reply_array_header(cur->fd, cnt) == 0)
+                {
+                    wrongtype = 0;
+                    EmitCtx ectx = { cur->fd };
+                    db_stream_xrange_emit(&srv->db, cur->key, cur->klen,
+                                          cur->start_ms, cur->start_seq,
+                                          UINT64_MAX, UINT64_MAX,
+                                          emit_xrange_entry_cb, &ectx, &wrongtype);
+                }
+                if (conns) conns[cur->fd].blocked = 0;
+                int fd_done = cur->fd;
+                BlockedWaiter *to_del = cur;
+                cur = cur->next;
+                if (prev) prev->next = cur; else srv->waiters = cur;
+                free(to_del->key); free(to_del);
+                // Remove any other waiters for this fd (e.g., multi-stream XREAD)
+                server_remove_waiter_by_fd(srv, NULL, fd_done);
+                continue;
+            }
+            // nothing yet
+            prev = cur; cur = cur->next;
+        }
+        else
+        {
+            prev = cur; cur = cur->next;
+        }
     }
 }
 
