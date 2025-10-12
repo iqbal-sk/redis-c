@@ -551,6 +551,31 @@ int db_stream_xrange_emit(DB *db, const char *key, size_t klen,
     return 0;
 }
 
+int db_stream_last_id(DB *db, const char *key, size_t klen,
+                      uint64_t *out_ms, uint64_t *out_seq,
+                      int *found, int *wrongtype)
+{
+    if (wrongtype) *wrongtype = 0;
+    if (found) *found = 0;
+    unsigned long b = 0; Entry *prev = NULL;
+    Entry *e = db_find(db, key, klen, &b, &prev);
+    if (!e) return 0;
+    if (e->type != OBJ_STREAM)
+    {
+        if (wrongtype) *wrongtype = 1;
+        return -1;
+    }
+    if (!e->data.stream.tail)
+        return 0;
+    uint64_t ms = 0, seq = 0;
+    if (parse_id_bytes(e->data.stream.tail->id, e->data.stream.tail->idlen, &ms, &seq) != 0)
+        return -1;
+    if (out_ms) *out_ms = ms;
+    if (out_seq) *out_seq = seq;
+    if (found) *found = 1;
+    return 0;
+}
+
 int db_type(DB *db, const char *key, size_t klen, ObjType *out_type, int *found)
 {
     if (found) *found = 0;

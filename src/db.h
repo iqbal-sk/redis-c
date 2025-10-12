@@ -95,3 +95,9 @@ int db_stream_xrange_emit(DB *db, const char *key, size_t klen,
                           uint64_t end_ms, uint64_t end_seq,
                           db_stream_emit_cb emit, void *ctx,
                           int *wrongtype);
+
+// Get last entry ID of a stream (tail). Sets *found=1 and outputs ms/seq.
+// If key missing or stream empty, sets *found=0. Returns 0 on success.
+int db_stream_last_id(DB *db, const char *key, size_t klen,
+                      uint64_t *out_ms, uint64_t *out_seq,
+                      int *found, int *wrongtype);
