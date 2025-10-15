@@ -33,6 +33,57 @@ typedef struct Arg
 
 typedef int (*cmd_handler)(int fd, Conn *c, DB *db, const Arg *args, size_t nargs);
 
+static void free_txn_queue(Conn *c)
+{
+    if (!c || !c->q) { c->qcount = 0; c->qcap = 0; return; }
+    for (size_t i = 0; i < c->qcount; i++)
+    {
+        if (c->q[i].cmd) free(c->q[i].cmd);
+        if (c->q[i].args)
+        {
+            for (size_t j = 0; j < c->q[i].nargs; j++)
+                free(c->q[i].args[j].ptr);
+            free(c->q[i].args);
+        }
+    }
+    free(c->q); c->q = NULL; c->qcount = 0; c->qcap = 0;
+}
+
+static int enqueue_txn(Conn *c, const char *cmd, size_t cmdlen, const Arg *args, size_t nargs)
+{
+    if (!c) return -1;
+    if (c->qcount == c->qcap)
+    {
+        size_t ncap = c->qcap ? c->qcap * 2 : 8;
+        QueuedCmd *nq = (QueuedCmd*)realloc(c->q, ncap * sizeof(*nq));
+        if (!nq) return -1;
+        c->q = nq; c->qcap = ncap;
+    }
+    QueuedCmd *qc = &c->q[c->qcount];
+    memset(qc, 0, sizeof(*qc));
+    qc->cmd = (char*)malloc(cmdlen);
+    if (cmdlen > 0 && !qc->cmd) return -1;
+    if (cmdlen > 0) memcpy(qc->cmd, cmd, cmdlen);
+    qc->cmdlen = cmdlen;
+    qc->nargs = nargs;
+    if (nargs > 0)
+    {
+        qc->args = (QArg*)calloc(nargs, sizeof(QArg));
+        if (!qc->args) { free(qc->cmd); return -1; }
+        for (size_t i = 0; i < nargs; i++)
+        {
+            qc->args[i].ptr = (char*)malloc(args[i].len);
+            if (args[i].len > 0 && !qc->args[i].ptr)
+                return -1;
+            if (args[i].len > 0)
+                memcpy(qc->args[i].ptr, args[i].ptr, args[i].len);
+            qc->args[i].len = args[i].len;
+        }
+    }
+    c->qcount++;
+    return 0;
+}
+
 static int handle_ping(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
@@ -122,7 +173,8 @@ static int handle_exec(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     if (!c || !c->in_multi)
         return reply_error(fd, "ERR EXEC without MULTI");
     // Queueing/execution will be implemented later.
-    // For now, reset transactional state and return empty array.
+    // For now, drop queued commands, reset transactional state and return empty array.
+    free_txn_queue(c);
     c->in_multi = 0;
     return reply_array_header(fd, 0);
 }
@@ -872,6 +924,20 @@ int process_conn(int fd, Conn *c, DB *db)
                 }
             }
             {
+                // Transaction queuing: if inside MULTI and not MULTI/EXEC, enqueue and reply QUEUED
+                if (c && c->in_multi && def->fn != handle_multi && def->fn != handle_exec)
+                {
+                    if (enqueue_txn(c, cmd, cmdlen, args, (size_t)nargs) != 0)
+                    {
+                        free(args);
+                        return reply_error(fd, "ERR transaction queue failed");
+                    }
+                    free(args);
+                    if (reply_simple(fd, "QUEUED") != 0)
+                        return -1;
+                    offset += pos;
+                    continue;
+                }
                 int rc = def->fn(fd, c, db, args, (size_t)nargs);
                 free(args);
                 if (rc != 0)
