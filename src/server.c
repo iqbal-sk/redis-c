@@ -73,6 +73,7 @@ int server_event_loop(Server *srv)
         conns[i].cap = 0;
         conns[i].active = 0;
         conns[i].blocked = 0;
+        conns[i].in_multi = 0;
     }
 
     fd_set master_set, read_fds;
