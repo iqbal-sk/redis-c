@@ -105,6 +105,32 @@ static int handle_get(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     return reply_null_bulk(fd);
 }
 
+static int handle_incr(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c);
+    if (nargs != 1)
+        return reply_error(fd, "ERR wrong number of arguments for 'INCR'");
+    const char *kptr = args[0].ptr; size_t klen = args[0].len;
+    const char *vptr = NULL; size_t vlen = 0;
+    if (db_get(db, kptr, klen, &vptr, &vlen) != 0)
+    {
+        // Later stages will handle non-existing key. For now, assume key exists.
+        return reply_error(fd, "ERR value is not an integer or out of range");
+    }
+    int64_t val = 0;
+    if (parse_i64_ascii(vptr, vlen, &val) != 0)
+        return reply_error(fd, "ERR value is not an integer or out of range");
+    if (val == INT64_MAX)
+        return reply_error(fd, "ERR increment or decrement would overflow");
+    int64_t nval = val + 1;
+    char buf[64];
+    int l = snprintf(buf, sizeof(buf), "%lld", (long long)nval);
+    if (l <= 0 || (size_t)l >= sizeof(buf))
+        return reply_error(fd, "ERR incr failed");
+    db_set(db, kptr, klen, buf, (size_t)l, 0);
+    return reply_int(fd, (long long)nval);
+}
+
 static int handle_type(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
@@ -637,6 +663,7 @@ static const CmdDef kCmds[] = {
     {"ECHO", 4, handle_echo},
     {"SET", 3, handle_set},
     {"GET", 3, handle_get},
+    {"INCR", 4, handle_incr},
     {"TYPE", 4, handle_type},
     // Lists
     {"LLEN", 4, handle_llen},
