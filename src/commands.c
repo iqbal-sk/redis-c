@@ -114,8 +114,10 @@ static int handle_incr(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     const char *vptr = NULL; size_t vlen = 0;
     if (db_get(db, kptr, klen, &vptr, &vlen) != 0)
     {
-        // Later stages will handle non-existing key. For now, assume key exists.
-        return reply_error(fd, "ERR value is not an integer or out of range");
+        // Key missing: initialize to 1
+        const char one[] = "1";
+        db_set(db, kptr, klen, one, sizeof(one) - 1, 0);
+        return reply_int(fd, 1);
     }
     int64_t val = 0;
     if (parse_i64_ascii(vptr, vlen, &val) != 0)
