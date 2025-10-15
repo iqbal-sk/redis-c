@@ -105,6 +105,14 @@ static int handle_get(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     return reply_null_bulk(fd);
 }
 
+static int handle_multi(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c); UNUSED(db);
+    if (nargs != 0)
+        return reply_error(fd, "ERR wrong number of arguments for 'MULTI'");
+    return reply_simple(fd, "OK");
+}
+
 static int handle_incr(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
@@ -665,6 +673,7 @@ static const CmdDef kCmds[] = {
     {"ECHO", 4, handle_echo},
     {"SET", 3, handle_set},
     {"GET", 3, handle_get},
+    {"MULTI", 5, handle_multi},
     {"INCR", 4, handle_incr},
     {"TYPE", 4, handle_type},
     // Lists
