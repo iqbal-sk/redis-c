@@ -107,10 +107,24 @@ static int handle_get(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 
 static int handle_multi(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
-    UNUSED(c); UNUSED(db);
+    UNUSED(db);
     if (nargs != 0)
         return reply_error(fd, "ERR wrong number of arguments for 'MULTI'");
+    if (c) c->in_multi = 1;
     return reply_simple(fd, "OK");
+}
+
+static int handle_exec(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(db);
+    if (nargs != 0)
+        return reply_error(fd, "ERR wrong number of arguments for 'EXEC'");
+    if (!c || !c->in_multi)
+        return reply_error(fd, "ERR EXEC without MULTI");
+    // Queueing/execution will be implemented later.
+    // For now, reset transactional state and return empty array.
+    c->in_multi = 0;
+    return reply_array_header(fd, 0);
 }
 
 static int handle_incr(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
@@ -674,6 +688,7 @@ static const CmdDef kCmds[] = {
     {"SET", 3, handle_set},
     {"GET", 3, handle_get},
     {"MULTI", 5, handle_multi},
+    {"EXEC", 4, handle_exec},
     {"INCR", 4, handle_incr},
     {"TYPE", 4, handle_type},
     // Lists

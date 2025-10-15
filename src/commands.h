@@ -9,6 +9,7 @@ typedef struct Conn {
     size_t cap;
     int active;
     int blocked;
+    int in_multi;
 } Conn;
 
 int ensure_capacity(Conn *c, size_t need);
