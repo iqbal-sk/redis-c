@@ -317,6 +317,17 @@ static int handle_replconf(int fd, Conn *c, DB *db, const Arg *args, size_t narg
     return reply_simple(fd, "OK");
 }
 
+static int handle_psync(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c); UNUSED(db);
+    // For this stage, always respond with FULLRESYNC <replid> 0
+    const char *rid = (g_srv && g_srv->replid[0]) ? g_srv->replid : "";
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "FULLRESYNC %s 0", rid);
+    if (n <= 0 || (size_t)n >= sizeof(buf)) return -1;
+    return reply_simple(fd, buf);
+}
+
 static int handle_llen(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
@@ -825,6 +836,7 @@ static const CmdDef kCmds[] = {
     {"SET", 3, handle_set},
     {"GET", 3, handle_get},
     {"REPLCONF", 8, handle_replconf},
+    {"PSYNC", 5, handle_psync},
     {"INFO", 4, handle_info},
     {"MULTI", 5, handle_multi},
     {"EXEC", 4, handle_exec},
