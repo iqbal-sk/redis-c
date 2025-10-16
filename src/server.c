@@ -7,21 +7,29 @@
 #include "server.h"
 #include "resp.h"
 
-typedef struct EmitCtx { int fd; } EmitCtx;
+typedef struct EmitCtx
+{
+    int fd;
+} EmitCtx;
 static int emit_xrange_entry_cb(void *ctx,
                                 const char *id, size_t idlen,
                                 const char **fkeys, const size_t *fklen,
                                 const char **fvals, const size_t *fvlen,
                                 size_t npairs)
 {
-    int fd = ((EmitCtx*)ctx)->fd;
-    if (reply_array_header(fd, 2) != 0) return -1;
-    if (reply_bulk(fd, id, idlen) != 0) return -1;
-    if (reply_array_header(fd, npairs * 2) != 0) return -1;
+    int fd = ((EmitCtx *)ctx)->fd;
+    if (reply_array_header(fd, 2) != 0)
+        return -1;
+    if (reply_bulk(fd, id, idlen) != 0)
+        return -1;
+    if (reply_array_header(fd, npairs * 2) != 0)
+        return -1;
     for (size_t i = 0; i < npairs; i++)
     {
-        if (reply_bulk(fd, fkeys[i], fklen[i]) != 0) return -1;
-        if (reply_bulk(fd, fvals[i], fvlen[i]) != 0) return -1;
+        if (reply_bulk(fd, fkeys[i], fklen[i]) != 0)
+            return -1;
+        if (reply_bulk(fd, fvals[i], fvlen[i]) != 0)
+            return -1;
     }
     return 0;
 }
@@ -85,18 +93,21 @@ int server_event_loop(Server *srv)
     FD_SET(srv->listen_fd, &master_set);
     int fdmax = srv->listen_fd;
 
-    struct sockaddr_in client_addr; int client_addr_len = 0;
+    struct sockaddr_in client_addr;
+    int client_addr_len = 0;
 
     while (1)
     {
         read_fds = master_set;
-        struct timeval *ptv = NULL; struct timeval tv;
+        struct timeval *ptv = NULL;
+        struct timeval tv;
         int64_t next_deadline = server_next_waiter_deadline(srv);
         if (next_deadline > 0)
         {
             int64_t now = now_ms();
             int64_t diff = next_deadline - now;
-            if (diff < 0) diff = 0;
+            if (diff < 0)
+                diff = 0;
             tv.tv_sec = (time_t)(diff / 1000);
             tv.tv_usec = (suseconds_t)((diff % 1000) * 1000);
             ptv = &tv;
@@ -104,7 +115,8 @@ int server_event_loop(Server *srv)
         int activity = select(fdmax + 1, &read_fds, NULL, NULL, ptv);
         if (activity < 0)
         {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             printf("select() failed: %s\n", strerror(errno));
             break;
         }
@@ -116,7 +128,8 @@ int server_event_loop(Server *srv)
         }
         for (int fd = 0; fd <= fdmax; fd++)
         {
-            if (!FD_ISSET(fd, &read_fds)) continue;
+            if (!FD_ISSET(fd, &read_fds))
+                continue;
             if (fd == srv->listen_fd)
             {
                 client_addr_len = sizeof(client_addr);
@@ -127,8 +140,10 @@ int server_event_loop(Server *srv)
                     continue;
                 }
                 FD_SET(cfd, &master_set);
-                if (cfd > fdmax) fdmax = cfd;
-                conns[cfd].active = 1; conns[cfd].len = 0;
+                if (cfd > fdmax)
+                    fdmax = cfd;
+                conns[cfd].active = 1;
+                conns[cfd].len = 0;
                 if (conns[cfd].cap == 0)
                 {
                     conns[cfd].cap = 8192;
@@ -136,7 +151,9 @@ int server_event_loop(Server *srv)
                     if (!conns[cfd].buf)
                     {
                         printf("malloc failed for connection buffer\n");
-                        close(cfd); FD_CLR(cfd, &master_set); conns[cfd].active = 0;
+                        close(cfd);
+                        FD_CLR(cfd, &master_set);
+                        conns[cfd].active = 0;
                     }
                 }
                 continue;
@@ -152,17 +169,24 @@ int server_event_loop(Server *srv)
             if (r > 0)
             {
                 Conn *c = &conns[fd];
-                if (!c->active) c->active = 1;
+                if (!c->active)
+                    c->active = 1;
                 if (ensure_capacity(&conns[fd], c->len + (size_t)r) != 0)
                 {
                     printf("Buffer alloc failed (fd=%d)\n", fd);
-                    close(fd); FD_CLR(fd, &master_set); c->active = 0; continue;
+                    close(fd);
+                    FD_CLR(fd, &master_set);
+                    c->active = 0;
+                    continue;
                 }
                 memcpy(c->buf + c->len, rbuf, (size_t)r);
                 c->len += (size_t)r;
                 if (process_conn(fd, c, &srv->db) != 0)
                 {
-                    close(fd); FD_CLR(fd, &master_set); c->active = 0; continue;
+                    close(fd);
+                    FD_CLR(fd, &master_set);
+                    c->active = 0;
+                    continue;
                 }
                 // After processing commands, try serving any waiters that can be fulfilled
                 server_serve_waiters(srv, conns);
@@ -170,13 +194,17 @@ int server_event_loop(Server *srv)
             else if (r == 0)
             {
                 server_remove_waiter_by_fd(srv, &conns[fd], fd);
-                close(fd); FD_CLR(fd, &master_set); conns[fd].active = 0;
+                close(fd);
+                FD_CLR(fd, &master_set);
+                conns[fd].active = 0;
             }
             else
             {
                 printf("Read failed (fd=%d): %s\n", fd, strerror(errno));
                 server_remove_waiter_by_fd(srv, &conns[fd], fd);
-                close(fd); FD_CLR(fd, &master_set); conns[fd].active = 0;
+                close(fd);
+                FD_CLR(fd, &master_set);
+                conns[fd].active = 0;
             }
         }
     }
@@ -186,12 +214,15 @@ int server_event_loop(Server *srv)
 
 int server_connect_master(Server *srv, const char *host, int port)
 {
-    if (!srv || !host) return -1;
+    if (!srv || !host)
+        return -1;
     srv->repl_fd = -1;
-    struct addrinfo hints; memset(&hints, 0, sizeof(hints));
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    char portstr[16]; snprintf(portstr, sizeof(portstr), "%d", port);
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
     struct addrinfo *res = NULL;
     int ga = getaddrinfo(host, portstr, &hints, &res);
     if (ga != 0 || !res)
@@ -199,16 +230,20 @@ int server_connect_master(Server *srv, const char *host, int port)
         printf("replica connect: getaddrinfo failed for %s:%s (%s)\n", host, portstr, gai_strerror(ga));
         return -1;
     }
-    int fd = -1; int rc = -1;
+    int fd = -1;
+    int rc = -1;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next)
     {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
+        if (fd < 0)
+            continue;
         if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
         {
-            rc = 0; break;
+            rc = 0;
+            break;
         }
-        close(fd); fd = -1;
+        close(fd);
+        fd = -1;
     }
     freeaddrinfo(res);
     if (rc != 0)
@@ -241,11 +276,11 @@ int server_connect_master(Server *srv, const char *host, int port)
         printf("replica connect: send REPLCONF capa failed (%s)\n", strerror(errno));
     }
     // Send PSYNC ? -1
-    const char *ps = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
-    if (send_all(fd, ps, strlen(ps)) != 0)
-    {
-        printf("replica connect: send PSYNC failed (%s)\n", strerror(errno));
-    }
+    // const char *ps = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+    // if (send_all(fd, ps, strlen(ps)) != 0)
+    // {
+    //     printf("replica connect: send PSYNC failed (%s)\n", strerror(errno));
+    // }
     // Store master coordinates on server for later stages
     strncpy(srv->master_host, host, sizeof(srv->master_host) - 1);
     srv->master_host[sizeof(srv->master_host) - 1] = '\0';
@@ -255,13 +290,20 @@ int server_connect_master(Server *srv, const char *host, int port)
 
 void server_add_waiter(Server *srv, Conn *c, int fd, const char *key, size_t klen, int64_t deadline_ms)
 {
-    if (!srv) return;
+    if (!srv)
+        return;
     BlockedWaiter *w = (BlockedWaiter *)calloc(1, sizeof(BlockedWaiter));
-    if (!w) return;
+    if (!w)
+        return;
     w->fd = fd;
     w->key = (char *)malloc(klen);
-    if (!w->key && klen > 0) { free(w); return; }
-    if (klen > 0) memcpy(w->key, key, klen);
+    if (!w->key && klen > 0)
+    {
+        free(w);
+        return;
+    }
+    if (klen > 0)
+        memcpy(w->key, key, klen);
     w->klen = klen;
     w->deadline_ms = deadline_ms;
     w->type = WAIT_LIST_BLPOP;
@@ -273,26 +315,36 @@ void server_add_waiter(Server *srv, Conn *c, int fd, const char *key, size_t kle
     else
     {
         BlockedWaiter *t = srv->waiters;
-        while (t->next) t = t->next;
+        while (t->next)
+            t = t->next;
         t->next = w;
     }
-    if (c) c->blocked = 1;
+    if (c)
+        c->blocked = 1;
 }
 
 void server_add_stream_waiter(Server *srv, Conn *c, int fd, const char *key, size_t klen,
                               uint64_t start_ms, uint64_t start_seq, int64_t deadline_ms)
 {
-    if (!srv) return;
+    if (!srv)
+        return;
     BlockedWaiter *w = (BlockedWaiter *)calloc(1, sizeof(BlockedWaiter));
-    if (!w) return;
+    if (!w)
+        return;
     w->fd = fd;
     w->key = (char *)malloc(klen);
-    if (!w->key && klen > 0) { free(w); return; }
-    if (klen > 0) memcpy(w->key, key, klen);
+    if (!w->key && klen > 0)
+    {
+        free(w);
+        return;
+    }
+    if (klen > 0)
+        memcpy(w->key, key, klen);
     w->klen = klen;
     w->deadline_ms = deadline_ms;
     w->type = WAIT_STREAM_XREAD;
-    w->start_ms = start_ms; w->start_seq = start_seq;
+    w->start_ms = start_ms;
+    w->start_seq = start_seq;
     w->next = NULL;
 
     if (!srv->waiters)
@@ -300,15 +352,18 @@ void server_add_stream_waiter(Server *srv, Conn *c, int fd, const char *key, siz
     else
     {
         BlockedWaiter *t = srv->waiters;
-        while (t->next) t = t->next;
+        while (t->next)
+            t = t->next;
         t->next = w;
     }
-    if (c) c->blocked = 1;
+    if (c)
+        c->blocked = 1;
 }
 
 void server_remove_waiter_by_fd(Server *srv, Conn *c, int fd)
 {
-    if (!srv) return;
+    if (!srv)
+        return;
     BlockedWaiter *prev = NULL, *cur = srv->waiters;
     while (cur)
     {
@@ -316,14 +371,19 @@ void server_remove_waiter_by_fd(Server *srv, Conn *c, int fd)
         {
             BlockedWaiter *to_del = cur;
             cur = cur->next;
-            if (prev) prev->next = cur; else srv->waiters = cur;
+            if (prev)
+                prev->next = cur;
+            else
+                srv->waiters = cur;
             free(to_del->key);
             free(to_del);
-            if (c) c->blocked = 0;
+            if (c)
+                c->blocked = 0;
             // do not break; remove all entries for fd just in case
             continue;
         }
-        prev = cur; cur = cur->next;
+        prev = cur;
+        cur = cur->next;
     }
 }
 
@@ -331,24 +391,35 @@ static int send_bulk_pair(int fd, const char *k, size_t klen, const char *v, siz
 {
     char h[64];
     int hl = snprintf(h, sizeof(h), "*2\r\n");
-    if (hl <= 0 || (size_t)hl >= sizeof(h)) return -1;
-    if (send_all(fd, h, (size_t)hl) != 0) return -1;
+    if (hl <= 0 || (size_t)hl >= sizeof(h))
+        return -1;
+    if (send_all(fd, h, (size_t)hl) != 0)
+        return -1;
     hl = snprintf(h, sizeof(h), "$%zu\r\n", klen);
-    if (hl <= 0 || (size_t)hl >= sizeof(h)) return -1;
-    if (send_all(fd, h, (size_t)hl) != 0) return -1;
-    if (send_all(fd, k, klen) != 0) return -1;
-    if (send_all(fd, "\r\n", 2) != 0) return -1;
+    if (hl <= 0 || (size_t)hl >= sizeof(h))
+        return -1;
+    if (send_all(fd, h, (size_t)hl) != 0)
+        return -1;
+    if (send_all(fd, k, klen) != 0)
+        return -1;
+    if (send_all(fd, "\r\n", 2) != 0)
+        return -1;
     hl = snprintf(h, sizeof(h), "$%zu\r\n", vlen);
-    if (hl <= 0 || (size_t)hl >= sizeof(h)) return -1;
-    if (send_all(fd, h, (size_t)hl) != 0) return -1;
-    if (send_all(fd, v, vlen) != 0) return -1;
-    if (send_all(fd, "\r\n", 2) != 0) return -1;
+    if (hl <= 0 || (size_t)hl >= sizeof(h))
+        return -1;
+    if (send_all(fd, h, (size_t)hl) != 0)
+        return -1;
+    if (send_all(fd, v, vlen) != 0)
+        return -1;
+    if (send_all(fd, "\r\n", 2) != 0)
+        return -1;
     return 0;
 }
 
 void server_serve_waiters(Server *srv, Conn *conns)
 {
-    if (!srv) return;
+    if (!srv)
+        return;
     BlockedWaiter *prev = NULL;
     BlockedWaiter *cur = srv->waiters;
     while (cur)
@@ -356,7 +427,8 @@ void server_serve_waiters(Server *srv, Conn *conns)
         if (cur->type == WAIT_LIST_BLPOP)
         {
             int wrongtype = 0;
-            char *v = NULL; size_t vlen = 0;
+            char *v = NULL;
+            size_t vlen = 0;
             int rc = db_list_lpop(&srv->db, cur->key, cur->klen, &v, &vlen, &wrongtype);
             if (rc == 0 && v)
             {
@@ -365,26 +437,35 @@ void server_serve_waiters(Server *srv, Conn *conns)
                     // ignore send error
                 }
                 free(v);
-                if (conns) conns[cur->fd].blocked = 0;
+                if (conns)
+                    conns[cur->fd].blocked = 0;
                 BlockedWaiter *to_del = cur;
                 cur = cur->next;
-                if (prev) prev->next = cur; else srv->waiters = cur;
-                free(to_del->key); free(to_del);
+                if (prev)
+                    prev->next = cur;
+                else
+                    srv->waiters = cur;
+                free(to_del->key);
+                free(to_del);
                 continue;
             }
-            prev = cur; cur = cur->next;
+            prev = cur;
+            cur = cur->next;
         }
         else if (cur->type == WAIT_STREAM_XREAD)
         {
             // See if any entries available strictly greater than the provided id (inclusive start already computed)
-            size_t cnt = 0; int wrongtype = 0;
+            size_t cnt = 0;
+            int wrongtype = 0;
             if (db_stream_xrange_count(&srv->db, cur->key, cur->klen,
                                        cur->start_ms, cur->start_seq,
                                        UINT64_MAX, UINT64_MAX,
                                        &cnt, &wrongtype) != 0)
             {
                 // wrongtype or error: treat as not ready
-                prev = cur; cur = cur->next; continue;
+                prev = cur;
+                cur = cur->next;
+                continue;
             }
             if (cnt > 0)
             {
@@ -395,35 +476,43 @@ void server_serve_waiters(Server *srv, Conn *conns)
                     reply_array_header(cur->fd, cnt) == 0)
                 {
                     wrongtype = 0;
-                    EmitCtx ectx = { cur->fd };
+                    EmitCtx ectx = {cur->fd};
                     db_stream_xrange_emit(&srv->db, cur->key, cur->klen,
                                           cur->start_ms, cur->start_seq,
                                           UINT64_MAX, UINT64_MAX,
                                           emit_xrange_entry_cb, &ectx, &wrongtype);
                 }
-                if (conns) conns[cur->fd].blocked = 0;
+                if (conns)
+                    conns[cur->fd].blocked = 0;
                 int fd_done = cur->fd;
                 BlockedWaiter *to_del = cur;
                 cur = cur->next;
-                if (prev) prev->next = cur; else srv->waiters = cur;
-                free(to_del->key); free(to_del);
+                if (prev)
+                    prev->next = cur;
+                else
+                    srv->waiters = cur;
+                free(to_del->key);
+                free(to_del);
                 // Remove any other waiters for this fd (e.g., multi-stream XREAD)
                 server_remove_waiter_by_fd(srv, NULL, fd_done);
                 continue;
             }
             // nothing yet
-            prev = cur; cur = cur->next;
+            prev = cur;
+            cur = cur->next;
         }
         else
         {
-            prev = cur; cur = cur->next;
+            prev = cur;
+            cur = cur->next;
         }
     }
 }
 
 void server_timeout_waiters(Server *srv, Conn *conns)
 {
-    if (!srv) return;
+    if (!srv)
+        return;
     int64_t now = now_ms();
     BlockedWaiter *prev = NULL, *cur = srv->waiters;
     while (cur)
@@ -435,25 +524,34 @@ void server_timeout_waiters(Server *srv, Conn *conns)
             {
                 // ignore send error
             }
-            if (conns) conns[cur->fd].blocked = 0;
+            if (conns)
+                conns[cur->fd].blocked = 0;
             BlockedWaiter *to_del = cur;
             cur = cur->next;
-            if (prev) prev->next = cur; else srv->waiters = cur;
-            free(to_del->key); free(to_del);
+            if (prev)
+                prev->next = cur;
+            else
+                srv->waiters = cur;
+            free(to_del->key);
+            free(to_del);
             continue;
         }
-        prev = cur; cur = cur->next;
+        prev = cur;
+        cur = cur->next;
     }
 }
 
 int64_t server_next_waiter_deadline(Server *srv)
 {
-    if (!srv) return 0;
+    if (!srv)
+        return 0;
     int64_t next = 0;
     for (BlockedWaiter *w = srv->waiters; w; w = w->next)
     {
-        if (w->deadline_ms <= 0) continue;
-        if (next == 0 || w->deadline_ms < next) next = w->deadline_ms;
+        if (w->deadline_ms <= 0)
+            continue;
+        if (next == 0 || w->deadline_ms < next)
+            next = w->deadline_ms;
     }
     return next;
 }
