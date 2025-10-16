@@ -88,6 +88,9 @@ int main(int argc, char **argv)
     srv.repl_fd = -1;
     srv.slave_fd = -1;
     srv.listen_port = port;
+    srv.replica_fds = NULL;
+    srv.nreplicas = 0;
+    srv.replicas_cap = 0;
     if (is_replica)
     {
         // Connect to master and send initial PING
