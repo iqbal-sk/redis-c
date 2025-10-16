@@ -16,6 +16,8 @@ typedef struct Server {
     char master_host[256];
     int master_port;
     int repl_handshake_step; // 0=idle, 1=sent PING, 2=sent REPLCONF port, 3=sent REPLCONF capa, 4=sent PSYNC
+    // Master side: single replica connection (for this stage)
+    int slave_fd; // -1 if no replica connected
 } Server;
 
 int server_listen(Server *srv, int port);

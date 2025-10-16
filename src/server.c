@@ -239,6 +239,7 @@ int server_event_loop(Server *srv)
             }
             else if (r == 0)
             {
+                if (fd == srv->slave_fd) srv->slave_fd = -1;
                 server_remove_waiter_by_fd(srv, &conns[fd], fd);
                 close(fd);
                 FD_CLR(fd, &master_set);
@@ -247,6 +248,7 @@ int server_event_loop(Server *srv)
             else
             {
                 printf("Read failed (fd=%d): %s\n", fd, strerror(errno));
+                if (fd == srv->slave_fd) srv->slave_fd = -1;
                 server_remove_waiter_by_fd(srv, &conns[fd], fd);
                 close(fd);
                 FD_CLR(fd, &master_set);
