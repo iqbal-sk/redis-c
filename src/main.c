@@ -86,6 +86,7 @@ int main(int argc, char **argv)
     srv.replid[sizeof(srv.replid) - 1] = '\0';
     srv.repl_offset = 0;
     srv.repl_fd = -1;
+    srv.listen_port = port;
     if (is_replica)
     {
         // Connect to master and send initial PING
