@@ -33,6 +33,10 @@ typedef struct Arg
 
 typedef int (*cmd_handler)(int fd, Conn *c, DB *db, const Arg *args, size_t nargs);
 
+// Forward declarations for transaction execution
+typedef struct CmdDef CmdDef; // incomplete type for pointer use
+static const CmdDef *find_cmd(const char *name, size_t nlen);
+
 static void free_txn_queue(Conn *c)
 {
     if (!c || !c->q) { c->qcount = 0; c->qcap = 0; return; }
@@ -172,11 +176,51 @@ static int handle_exec(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
         return reply_error(fd, "ERR wrong number of arguments for 'EXEC'");
     if (!c || !c->in_multi)
         return reply_error(fd, "ERR EXEC without MULTI");
-    // Queueing/execution will be implemented later.
-    // For now, drop queued commands, reset transactional state and return empty array.
-    free_txn_queue(c);
+    // Execute queued commands in order and return their replies in a single array.
+    size_t n = c->qcount;
+    if (reply_array_header(fd, n) != 0)
+        return -1;
+    // Disable transaction mode during execution to avoid re-queuing
     c->in_multi = 0;
-    return reply_array_header(fd, 0);
+    for (size_t i = 0; i < n; i++)
+    {
+        QueuedCmd *qc = &c->q[i];
+        const CmdDef *def = find_cmd(qc->cmd, qc->cmdlen);
+        if (!def)
+        {
+            if (reply_error(fd, "ERR unknown command") != 0)
+            {
+                free_txn_queue(c);
+                return -1;
+            }
+            continue;
+        }
+        // Build Arg slices referencing queued copies
+        Arg *qargs = NULL;
+        if (qc->nargs > 0)
+        {
+            qargs = (Arg*)calloc(qc->nargs, sizeof(Arg));
+            if (!qargs)
+            {
+                free_txn_queue(c);
+                return -1;
+            }
+            for (size_t a = 0; a < qc->nargs; a++)
+            {
+                qargs[a].ptr = qc->args[a].ptr;
+                qargs[a].len = qc->args[a].len;
+            }
+        }
+        int rc = def->fn(fd, c, db, qargs, qc->nargs);
+        free(qargs);
+        if (rc != 0)
+        {
+            free_txn_queue(c);
+            return -1;
+        }
+    }
+    free_txn_queue(c);
+    return 0;
 }
 
 static int handle_incr(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
