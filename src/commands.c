@@ -258,6 +258,18 @@ static int handle_incr(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     return reply_int(fd, (long long)nval);
 }
 
+static int handle_discard(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(db);
+    if (nargs != 0)
+        return reply_error(fd, "ERR wrong number of arguments for 'DISCARD'");
+    if (!c || !c->in_multi)
+        return reply_error(fd, "ERR DISCARD without MULTI");
+    free_txn_queue(c);
+    c->in_multi = 0;
+    return reply_simple(fd, "OK");
+}
+
 static int handle_type(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
@@ -787,6 +799,7 @@ static const CmdDef kCmds[] = {
     {"GET", 3, handle_get},
     {"MULTI", 5, handle_multi},
     {"EXEC", 4, handle_exec},
+    {"DISCARD", 7, handle_discard},
     {"INCR", 4, handle_incr},
     {"TYPE", 4, handle_type},
     // Lists
@@ -971,7 +984,7 @@ int process_conn(int fd, Conn *c, DB *db)
             }
             {
                 // Transaction queuing: if inside MULTI and not MULTI/EXEC, enqueue and reply QUEUED
-                if (c && c->in_multi && def->fn != handle_multi && def->fn != handle_exec)
+                if (c && c->in_multi && def->fn != handle_multi && def->fn != handle_exec && def->fn != handle_discard)
                 {
                     if (enqueue_txn(c, cmd, cmdlen, args, (size_t)nargs) != 0)
                     {
