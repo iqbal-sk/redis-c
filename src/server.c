@@ -3,6 +3,7 @@
 #include <netinet/ip.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <netdb.h>
 #include "server.h"
 #include "resp.h"
 
@@ -180,6 +181,53 @@ int server_event_loop(Server *srv)
         }
     }
 
+    return 0;
+}
+
+int server_connect_master(Server *srv, const char *host, int port)
+{
+    if (!srv || !host) return -1;
+    srv->repl_fd = -1;
+    struct addrinfo hints; memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[16]; snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo *res = NULL;
+    int ga = getaddrinfo(host, portstr, &hints, &res);
+    if (ga != 0 || !res)
+    {
+        printf("replica connect: getaddrinfo failed for %s:%s (%s)\n", host, portstr, gai_strerror(ga));
+        return -1;
+    }
+    int fd = -1; int rc = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next)
+    {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+        {
+            rc = 0; break;
+        }
+        close(fd); fd = -1;
+    }
+    freeaddrinfo(res);
+    if (rc != 0)
+    {
+        printf("replica connect: unable to connect to %s:%d (%s)\n", host, port, strerror(errno));
+        return -1;
+    }
+    srv->repl_fd = fd;
+    // Send PING as RESP array: *1\r\n$4\r\nPING\r\n
+    const char *ping = "*1\r\n$4\r\nPING\r\n";
+    if (send_all(fd, ping, strlen(ping)) != 0)
+    {
+        printf("replica connect: send PING failed (%s)\n", strerror(errno));
+        // Keep connection open; later stages may retry
+    }
+    // Store master coordinates on server for later stages
+    strncpy(srv->master_host, host, sizeof(srv->master_host) - 1);
+    srv->master_host[sizeof(srv->master_host) - 1] = '\0';
+    srv->master_port = port;
     return 0;
 }
 

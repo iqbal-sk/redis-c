@@ -10,10 +10,15 @@ typedef struct Server {
     int is_replica; // 0 => master, 1 => replica
     char replid[41];
     long long repl_offset;
+    // Replication (outbound) connection
+    int repl_fd; // -1 if not connected
+    char master_host[256];
+    int master_port;
 } Server;
 
 int server_listen(Server *srv, int port);
 int server_event_loop(Server *srv);
+int server_connect_master(Server *srv, const char *host, int port);
 
 typedef enum WaitType {
     WAIT_LIST_BLPOP = 1,
