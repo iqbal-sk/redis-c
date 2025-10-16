@@ -290,6 +290,22 @@ static int handle_type(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     return reply_simple(fd, "none");
 }
 
+static int handle_info(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c); UNUSED(db);
+    // For this stage, support INFO replication (and default to replication when no arg)
+    if (nargs == 0 || (nargs == 1 && args[0].len == 11 && ascii_casecmp_n(args[0].ptr, "replication", 11) == 0))
+    {
+        const char *role = (g_srv && g_srv->is_replica) ? "slave" : "master";
+        char buf[128];
+        int n = snprintf(buf, sizeof(buf), "# Replication\r\nrole:%s\r\n", role);
+        if (n <= 0 || (size_t)n >= sizeof(buf)) return -1;
+        return reply_bulk(fd, buf, (size_t)n);
+    }
+    // Other sections not implemented yet: return empty bulk string
+    return reply_bulk(fd, "", 0);
+}
+
 static int handle_llen(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
@@ -797,6 +813,7 @@ static const CmdDef kCmds[] = {
     {"ECHO", 4, handle_echo},
     {"SET", 3, handle_set},
     {"GET", 3, handle_get},
+    {"INFO", 4, handle_info},
     {"MULTI", 5, handle_multi},
     {"EXEC", 4, handle_exec},
     {"DISCARD", 7, handle_discard},
