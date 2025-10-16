@@ -297,8 +297,12 @@ static int handle_info(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     if (nargs == 0 || (nargs == 1 && args[0].len == 11 && ascii_casecmp_n(args[0].ptr, "replication", 11) == 0))
     {
         const char *role = (g_srv && g_srv->is_replica) ? "slave" : "master";
-        char buf[128];
-        int n = snprintf(buf, sizeof(buf), "# Replication\r\nrole:%s\r\n", role);
+        const char *replid = (g_srv && g_srv->replid[0]) ? g_srv->replid : "";
+        long long off = (g_srv) ? g_srv->repl_offset : 0;
+        char buf[512];
+        int n = snprintf(buf, sizeof(buf),
+                         "# Replication\r\nrole:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%lld\r\n",
+                         role, replid, off);
         if (n <= 0 || (size_t)n >= sizeof(buf)) return -1;
         return reply_bulk(fd, buf, (size_t)n);
     }

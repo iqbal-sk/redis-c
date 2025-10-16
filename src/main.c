@@ -83,6 +83,11 @@ int main(int argc, char **argv)
         return 1;
     }
     srv.is_replica = is_replica;
+    // Initialize replication id & offset (static for this stage)
+    const char *rid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+    strncpy(srv.replid, rid, sizeof(srv.replid) - 1);
+    srv.replid[sizeof(srv.replid) - 1] = '\0';
+    srv.repl_offset = 0;
     if (server_listen(&srv, port) != 0)
     {
         db_free(&srv.db);
