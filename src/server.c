@@ -92,6 +92,11 @@ int server_event_loop(Server *srv)
     FD_ZERO(&master_set);
     FD_SET(srv->listen_fd, &master_set);
     int fdmax = srv->listen_fd;
+    if (srv->repl_fd >= 0)
+    {
+        FD_SET(srv->repl_fd, &master_set);
+        if (srv->repl_fd > fdmax) fdmax = srv->repl_fd;
+    }
 
     struct sockaddr_in client_addr;
     int client_addr_len = 0;
@@ -154,6 +159,47 @@ int server_event_loop(Server *srv)
                         close(cfd);
                         FD_CLR(cfd, &master_set);
                         conns[cfd].active = 0;
+                    }
+                }
+                continue;
+            }
+            // replication master socket
+            if (srv->repl_fd >= 0 && fd == srv->repl_fd)
+            {
+                char mbuf[512];
+                ssize_t mr = read(fd, mbuf, sizeof(mbuf));
+                if (mr <= 0)
+                {
+                    // master closed; stop tracking
+                    FD_CLR(fd, &master_set); srv->repl_fd = -1; srv->repl_handshake_step = 0;
+                }
+                else
+                {
+                    // Advance handshake on any response
+                    if (srv->repl_handshake_step == 1)
+                    {
+                        // Send REPLCONF listening-port <port>
+                        char rp1[128];
+                        int l1 = snprintf(rp1, sizeof(rp1),
+                                          "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%d\r\n",
+                                          (int)snprintf(NULL, 0, "%d", srv->listen_port), srv->listen_port);
+                        if (l1 > 0 && (size_t)l1 < sizeof(rp1))
+                            (void)send_all(fd, rp1, (size_t)l1);
+                        srv->repl_handshake_step = 2;
+                    }
+                    else if (srv->repl_handshake_step == 2)
+                    {
+                        // Send REPLCONF capa psync2
+                        const char *rp2 = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
+                        (void)send_all(fd, rp2, strlen(rp2));
+                        srv->repl_handshake_step = 3;
+                    }
+                    else if (srv->repl_handshake_step == 3)
+                    {
+                        // Send PSYNC ? -1 (later stage, fine to send now if present)
+                        const char *ps = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+                        (void)send_all(fd, ps, strlen(ps));
+                        srv->repl_handshake_step = 4;
                     }
                 }
                 continue;
@@ -259,33 +305,19 @@ int server_connect_master(Server *srv, const char *host, int port)
         printf("replica connect: send PING failed (%s)\n", strerror(errno));
         // Keep connection open; later stages may retry
     }
-    // Send REPLCONF listening-port <port>
-    // char rp1[128];
-    // int l1 = snprintf(rp1, sizeof(rp1),
-    //                   "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%d\r\n",
-    //                   (int)snprintf(NULL, 0, "%d", srv->listen_port), srv->listen_port);
-    // if (l1 > 0 && (size_t)l1 < sizeof(rp1))
+    // Set handshake step: await PING response before sending REPLCONF
+    srv->repl_handshake_step = 1;
+    // Send PSYNC ? -1
+    // const char *ps = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+    // if (send_all(fd, ps, strlen(ps)) != 0)
     // {
-    //     if (send_all(fd, rp1, (size_t)l1) != 0)
-    //         printf("replica connect: send REPLCONF listening-port failed (%s)\n", strerror(errno));
+    //     printf("replica connect: send PSYNC failed (%s)\n", strerror(errno));
     // }
-    // // Send REPLCONF capa psync2
-    // const char *rp2 = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
-    // if (send_all(fd, rp2, strlen(rp2)) != 0)
-    // {
-    //     printf("replica connect: send REPLCONF capa failed (%s)\n", strerror(errno));
-}
-// Send PSYNC ? -1
-// const char *ps = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
-// if (send_all(fd, ps, strlen(ps)) != 0)
-// {
-//     printf("replica connect: send PSYNC failed (%s)\n", strerror(errno));
-// }
-// Store master coordinates on server for later stages
-strncpy(srv->master_host, host, sizeof(srv->master_host) - 1);
-srv->master_host[sizeof(srv->master_host) - 1] = '\0';
-srv->master_port = port;
-return 0;
+    // Store master coordinates on server for later stages
+    strncpy(srv->master_host, host, sizeof(srv->master_host) - 1);
+    srv->master_host[sizeof(srv->master_host) - 1] = '\0';
+    srv->master_port = port;
+    return 0;
 }
 
 void server_add_waiter(Server *srv, Conn *c, int fd, const char *key, size_t klen, int64_t deadline_ms)

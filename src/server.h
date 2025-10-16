@@ -15,6 +15,7 @@ typedef struct Server {
     int repl_fd; // -1 if not connected
     char master_host[256];
     int master_port;
+    int repl_handshake_step; // 0=idle, 1=sent PING, 2=sent REPLCONF port, 3=sent REPLCONF capa, 4=sent PSYNC
 } Server;
 
 int server_listen(Server *srv, int port);
