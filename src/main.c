@@ -8,6 +8,8 @@ int main(int argc, char **argv)
 
     int port = 6379;
     int is_replica = 0;
+    char master_host[256] = {0};
+    int master_port = 0;
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--port") == 0)
@@ -40,14 +42,10 @@ int main(int argc, char **argv)
             const char *space = strchr(arg1, ' ');
             if (space)
             {
-                // Split arg1 into host and port (copy into a temp buffer)
                 size_t hlen = (size_t)(space - arg1);
-                char *tmp = (char*)malloc(hlen + 1);
-                if (!tmp) { fprintf(stderr, "OOM parsing --replicaof\n"); return 1; }
-                memcpy(tmp, arg1, hlen); tmp[hlen] = '\0';
-                host = tmp;
+                if (hlen >= sizeof(master_host)) hlen = sizeof(master_host) - 1;
+                memcpy(master_host, arg1, hlen); master_host[hlen] = '\0';
                 portstr = space + 1;
-                // Validate port part has only digits
             }
             else
             {
@@ -56,7 +54,8 @@ int main(int argc, char **argv)
                     fprintf(stderr, "Missing port in --replicaof\n");
                     return 1;
                 }
-                host = arg1;
+                strncpy(master_host, arg1, sizeof(master_host) - 1);
+                master_host[sizeof(master_host) - 1] = '\0';
                 portstr = argv[++i];
             }
             char *e2 = NULL; long mp = strtol(portstr, &e2, 10);
@@ -65,10 +64,8 @@ int main(int argc, char **argv)
                 fprintf(stderr, "Invalid replica port: %s\n", portstr);
                 return 1;
             }
-            // For this stage, we only need the role; ignore host/port storage for now.
             is_replica = 1;
-            // Free temp host copy if allocated via split with space
-            if (space) free((void*)host);
+            master_port = (int)mp;
         }
         else
         {
@@ -88,6 +85,12 @@ int main(int argc, char **argv)
     strncpy(srv.replid, rid, sizeof(srv.replid) - 1);
     srv.replid[sizeof(srv.replid) - 1] = '\0';
     srv.repl_offset = 0;
+    srv.repl_fd = -1;
+    if (is_replica)
+    {
+        // Connect to master and send initial PING
+        server_connect_master(&srv, master_host, master_port);
+    }
     if (server_listen(&srv, port) != 0)
     {
         db_free(&srv.db);
