@@ -342,8 +342,11 @@ static int handle_psync(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     if (hl <= 0 || (size_t)hl >= sizeof(h)) return -1;
     if (send_all(fd, h, (size_t)hl) != 0) return -1;
     if (kEmptyRDBLen > 0 && send_all(fd, (const char*)kEmptyRDB, kEmptyRDBLen) != 0) return -1;
-    // Mark this fd as the replica connection for propagation
-    if (g_srv) g_srv->slave_fd = fd;
+    // Mark this fd as the replica connection for propagation (legacy single + new list)
+    if (g_srv) {
+        g_srv->slave_fd = fd; // legacy path
+        server_add_replica_fd(g_srv, fd);
+    }
     return 0;
 }
 
@@ -1060,7 +1063,7 @@ int process_conn(int fd, Conn *c, DB *db)
                 // Execute command
                 int rc = def->fn(fd, c, db, args, (size_t)nargs);
                 // Propagate write commands to a single replica (if acting as master)
-                if (rc == 0 && g_srv && !g_srv->is_replica && g_srv->slave_fd >= 0)
+                if (rc == 0 && g_srv && !g_srv->is_replica)
                 {
                     // Minimal write set for this stage
                     int is_write = 0;
@@ -1072,19 +1075,18 @@ int process_conn(int fd, Conn *c, DB *db)
                     if (!is_write && cmdlen == 4 && ascii_casecmp_n(cmd, "LPOP", 4) == 0) is_write = 1;
                     if (is_write)
                     {
-                        // Send RESP array: [CMD, arg1, arg2, ...]
-                        size_t ac = (size_t)nargs + 1;
-                        if (reply_array_header(g_srv->slave_fd, ac) == 0)
+                        // Fan-out to all connected replicas
+                        for (size_t ri = 0; ri < g_srv->nreplicas; ri++)
                         {
-                            if (reply_bulk(g_srv->slave_fd, cmd, cmdlen) == 0)
+                            int rfd = g_srv->replica_fds[ri];
+                            if (rfd < 0) continue;
+                            size_t ac = (size_t)nargs + 1;
+                            if (reply_array_header(rfd, ac) != 0) continue;
+                            if (reply_bulk(rfd, cmd, cmdlen) != 0) continue;
+                            for (long i = 0; i < nargs; i++)
                             {
-                                int ok = 1;
-                                for (long i = 0; i < nargs; i++)
-                                {
-                                    if (reply_bulk(g_srv->slave_fd, args[i].ptr, args[i].len) != 0)
-                                    { ok = 0; break; }
-                                }
-                                (void)ok; // ignore failures silently per stage guidance
+                                if (reply_bulk(rfd, args[i].ptr, args[i].len) != 0)
+                                    break;
                             }
                         }
                     }
