@@ -5,6 +5,7 @@
 
 typedef struct Server {
     int listen_fd;
+    int listen_port;
     DB db;
     struct BlockedWaiter *waiters;
     int is_replica; // 0 => master, 1 => replica
