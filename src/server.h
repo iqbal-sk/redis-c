@@ -16,13 +16,20 @@ typedef struct Server {
     char master_host[256];
     int master_port;
     int repl_handshake_step; // 0=idle, 1=sent PING, 2=sent REPLCONF port, 3=sent REPLCONF capa, 4=sent PSYNC
-    // Master side: single replica connection (for this stage)
-    int slave_fd; // -1 if no replica connected
+    // Master side: single replica connection (legacy) and list for future multi-replica support
+    int slave_fd; // -1 if no replica connected (legacy single-replica path)
+    int *replica_fds;
+    size_t nreplicas;
+    size_t replicas_cap;
 } Server;
 
 int server_listen(Server *srv, int port);
 int server_event_loop(Server *srv);
 int server_connect_master(Server *srv, const char *host, int port);
+// Replica tracking (master side)
+void server_add_replica_fd(Server *srv, int fd);
+void server_remove_replica_fd(Server *srv, int fd);
+int server_get_one_replica_fd(Server *srv); // returns a single replica fd (first), -1 if none
 
 typedef enum WaitType {
     WAIT_LIST_BLPOP = 1,

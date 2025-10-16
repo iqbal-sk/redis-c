@@ -240,6 +240,7 @@ int server_event_loop(Server *srv)
             else if (r == 0)
             {
                 if (fd == srv->slave_fd) srv->slave_fd = -1;
+                server_remove_replica_fd(srv, fd);
                 server_remove_waiter_by_fd(srv, &conns[fd], fd);
                 close(fd);
                 FD_CLR(fd, &master_set);
@@ -249,6 +250,7 @@ int server_event_loop(Server *srv)
             {
                 printf("Read failed (fd=%d): %s\n", fd, strerror(errno));
                 if (fd == srv->slave_fd) srv->slave_fd = -1;
+                server_remove_replica_fd(srv, fd);
                 server_remove_waiter_by_fd(srv, &conns[fd], fd);
                 close(fd);
                 FD_CLR(fd, &master_set);
@@ -320,6 +322,41 @@ int server_connect_master(Server *srv, const char *host, int port)
     srv->master_host[sizeof(srv->master_host) - 1] = '\0';
     srv->master_port = port;
     return 0;
+}
+
+void server_add_replica_fd(Server *srv, int fd)
+{
+    if (!srv || fd < 0) return;
+    // Ensure not already present
+    for (size_t i = 0; i < srv->nreplicas; i++)
+        if (srv->replica_fds[i] == fd) return;
+    if (srv->nreplicas == srv->replicas_cap)
+    {
+        size_t ncap = srv->replicas_cap ? srv->replicas_cap * 2 : 4;
+        int *nf = (int*)realloc(srv->replica_fds, ncap * sizeof(int));
+        if (!nf) return;
+        srv->replica_fds = nf; srv->replicas_cap = ncap;
+    }
+    srv->replica_fds[srv->nreplicas++] = fd;
+}
+
+void server_remove_replica_fd(Server *srv, int fd)
+{
+    if (!srv || fd < 0 || srv->nreplicas == 0) return;
+    size_t w = 0;
+    for (size_t i = 0; i < srv->nreplicas; i++)
+    {
+        if (srv->replica_fds[i] != fd)
+            srv->replica_fds[w++] = srv->replica_fds[i];
+    }
+    srv->nreplicas = w;
+    // do not shrink for simplicity
+}
+
+int server_get_one_replica_fd(Server *srv)
+{
+    if (!srv || srv->nreplicas == 0) return -1;
+    return srv->replica_fds[0];
 }
 
 void server_add_waiter(Server *srv, Conn *c, int fd, const char *key, size_t klen, int64_t deadline_ms)
