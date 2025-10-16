@@ -8,6 +8,8 @@ typedef struct Server {
     DB db;
     struct BlockedWaiter *waiters;
     int is_replica; // 0 => master, 1 => replica
+    char replid[41];
+    long long repl_offset;
 } Server;
 
 int server_listen(Server *srv, int port);
