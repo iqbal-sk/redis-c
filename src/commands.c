@@ -310,6 +310,13 @@ static int handle_info(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     return reply_bulk(fd, "", 0);
 }
 
+static int handle_replconf(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
+{
+    UNUSED(c); UNUSED(db); UNUSED(args); UNUSED(nargs);
+    // As master: acknowledge any REPLCONF variant with OK
+    return reply_simple(fd, "OK");
+}
+
 static int handle_llen(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
 {
     UNUSED(c);
@@ -817,6 +824,7 @@ static const CmdDef kCmds[] = {
     {"ECHO", 4, handle_echo},
     {"SET", 3, handle_set},
     {"GET", 3, handle_get},
+    {"REPLCONF", 8, handle_replconf},
     {"INFO", 4, handle_info},
     {"MULTI", 5, handle_multi},
     {"EXEC", 4, handle_exec},
