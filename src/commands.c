@@ -37,6 +37,13 @@ typedef int (*cmd_handler)(int fd, Conn *c, DB *db, const Arg *args, size_t narg
 typedef struct CmdDef CmdDef; // incomplete type for pointer use
 static const CmdDef *find_cmd(const char *name, size_t nlen);
 
+// Provide complete definition before we dereference def->fn in handle_exec
+struct CmdDef {
+    const char *name;
+    size_t nlen;
+    cmd_handler fn;
+};
+
 static void free_txn_queue(Conn *c)
 {
     if (!c || !c->q) { c->qcount = 0; c->qcap = 0; return; }
@@ -771,12 +778,7 @@ static int handle_xread(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     free(s_ms); free(s_seq); free(counts);
     return 0;
 }
-typedef struct CmdDef
-{
-    const char *name;
-    size_t nlen;
-    cmd_handler fn;
-} CmdDef;
+typedef struct CmdDef CmdDef;
 
 static const CmdDef kCmds[] = {
     {"PING", 4, handle_ping},
