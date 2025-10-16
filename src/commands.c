@@ -342,6 +342,8 @@ static int handle_psync(int fd, Conn *c, DB *db, const Arg *args, size_t nargs)
     if (hl <= 0 || (size_t)hl >= sizeof(h)) return -1;
     if (send_all(fd, h, (size_t)hl) != 0) return -1;
     if (kEmptyRDBLen > 0 && send_all(fd, (const char*)kEmptyRDB, kEmptyRDBLen) != 0) return -1;
+    // Mark this fd as the replica connection for propagation
+    if (g_srv) g_srv->slave_fd = fd;
     return 0;
 }
 
@@ -1003,7 +1005,7 @@ int process_conn(int fd, Conn *c, DB *db)
                     }
                     long alen = 0;
                     size_t abu = 0;
-                    if (parse_crlf_int(p + pos + 1, rem - pos - 1, &alen, &abu) != 0)
+        if (parse_crlf_int(p + pos + 1, rem - pos - 1, &alen, &abu) != 0)
                     {
                         free(args);
                         args = NULL;
@@ -1055,7 +1057,38 @@ int process_conn(int fd, Conn *c, DB *db)
                     offset += pos;
                     continue;
                 }
+                // Execute command
                 int rc = def->fn(fd, c, db, args, (size_t)nargs);
+                // Propagate write commands to a single replica (if acting as master)
+                if (rc == 0 && g_srv && !g_srv->is_replica && g_srv->slave_fd >= 0)
+                {
+                    // Minimal write set for this stage
+                    int is_write = 0;
+                    if (cmdlen == 3 && ascii_casecmp_n(cmd, "SET", 3) == 0) is_write = 1;
+                    if (!is_write && cmdlen == 4 && ascii_casecmp_n(cmd, "INCR", 4) == 0) is_write = 1;
+                    if (!is_write && cmdlen == 5 && ascii_casecmp_n(cmd, "XADD", 4) == 0) is_write = 1;
+                    if (!is_write && cmdlen == 5 && ascii_casecmp_n(cmd, "LPUSH", 5) == 0) is_write = 1;
+                    if (!is_write && cmdlen == 5 && ascii_casecmp_n(cmd, "RPUSH", 5) == 0) is_write = 1;
+                    if (!is_write && cmdlen == 4 && ascii_casecmp_n(cmd, "LPOP", 4) == 0) is_write = 1;
+                    if (is_write)
+                    {
+                        // Send RESP array: [CMD, arg1, arg2, ...]
+                        size_t ac = (size_t)nargs + 1;
+                        if (reply_array_header(g_srv->slave_fd, ac) == 0)
+                        {
+                            if (reply_bulk(g_srv->slave_fd, cmd, cmdlen) == 0)
+                            {
+                                int ok = 1;
+                                for (long i = 0; i < nargs; i++)
+                                {
+                                    if (reply_bulk(g_srv->slave_fd, args[i].ptr, args[i].len) != 0)
+                                    { ok = 0; break; }
+                                }
+                                (void)ok; // ignore failures silently per stage guidance
+                            }
+                        }
+                    }
+                }
                 free(args);
                 if (rc != 0)
                     return -1;
