@@ -16,6 +16,8 @@ typedef struct Server {
     char master_host[256];
     int master_port;
     int repl_handshake_step; // 0=idle, 1=sent PING, 2=sent REPLCONF port, 3=sent REPLCONF capa, 4=sent PSYNC
+    int repl_expect_rdb; // 1 if expecting FULLRESYNC + RDB after PSYNC
+    size_t repl_rdb_remaining; // bytes of RDB left to read
     // Master side: single replica connection (legacy) and list for future multi-replica support
     int slave_fd; // -1 if no replica connected (legacy single-replica path)
     int *replica_fds;

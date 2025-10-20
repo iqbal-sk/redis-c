@@ -96,6 +96,16 @@ int server_event_loop(Server *srv)
     {
         FD_SET(srv->repl_fd, &master_set);
         if (srv->repl_fd > fdmax) fdmax = srv->repl_fd;
+        // Prepare connection buffer for replication fd to reuse parser
+        if (srv->repl_fd < FD_SETSIZE)
+        {
+            conns[srv->repl_fd].active = 1;
+            if (conns[srv->repl_fd].cap == 0)
+            {
+                conns[srv->repl_fd].cap = 8192;
+                conns[srv->repl_fd].buf = malloc(conns[srv->repl_fd].cap);
+            }
+        }
     }
 
     struct sockaddr_in client_addr;
@@ -166,7 +176,7 @@ int server_event_loop(Server *srv)
             // replication master socket
             if (srv->repl_fd >= 0 && fd == srv->repl_fd)
             {
-                char mbuf[512];
+                char mbuf[4096];
                 ssize_t mr = read(fd, mbuf, sizeof(mbuf));
                 if (mr <= 0)
                 {
@@ -175,6 +185,13 @@ int server_event_loop(Server *srv)
                 }
                 else
                 {
+                    // Append into connection buffer for subsequent parsing
+                    Conn *c = &conns[fd];
+                    if (ensure_capacity(c, c->len + (size_t)mr) == 0)
+                    {
+                        memcpy(c->buf + c->len, mbuf, (size_t)mr);
+                        c->len += (size_t)mr;
+                    }
                     // Advance handshake on any response
                     if (srv->repl_handshake_step == 1)
                     {
@@ -200,6 +217,71 @@ int server_event_loop(Server *srv)
                         const char *ps = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
                         (void)send_all(fd, ps, strlen(ps));
                         srv->repl_handshake_step = 4;
+                        srv->repl_expect_rdb = 1;
+                        srv->repl_rdb_remaining = 0;
+                    }
+                    // If expecting RDB, consume FULLRESYNC line, parse bulk len, and drain body
+                    if (srv->repl_expect_rdb)
+                    {
+                        // Work within c->buf
+                        size_t off = 0;
+                        while (1)
+                        {
+                            if (srv->repl_rdb_remaining == 0)
+                            {
+                                // Need a line
+                                char *lf = memchr(c->buf + off, '\n', c->len - off);
+                                if (!lf) break; // wait more
+                                size_t linelen = (size_t)(lf - (c->buf + off) + 1);
+                                // If line starts with '+', it's FULLRESYNC; drop it
+                                if (c->buf[off] == '+')
+                                {
+                                    off += linelen;
+                                    continue;
+                                }
+                                // If line starts with '$', parse length
+                                if (c->buf[off] == '$')
+                                {
+                                    long blen = 0; size_t used = 0;
+                                    if (parse_crlf_int(c->buf + off + 1, c->len - off - 1, &blen, &used) != 0)
+                                        break; // malformed/incomplete
+                                    off += 1 + used;
+                                    srv->repl_rdb_remaining = (size_t)((blen < 0) ? 0 : blen);
+                                }
+                                else
+                                {
+                                    // Unexpected line, drop it
+                                    off += linelen;
+                                }
+                            }
+                            // Drain body if we have enough
+                            size_t avail = c->len - off;
+                            if (srv->repl_rdb_remaining > 0)
+                            {
+                                if (avail >= srv->repl_rdb_remaining)
+                                {
+                                    off += srv->repl_rdb_remaining;
+                                    srv->repl_rdb_remaining = 0;
+                                    srv->repl_expect_rdb = 0; // done with RDB
+                                }
+                                else
+                                {
+                                    srv->repl_rdb_remaining -= avail;
+                                    off = c->len;
+                                }
+                            }
+                            if (srv->repl_rdb_remaining == 0) break;
+                        }
+                        if (off > 0)
+                        {
+                            if (off < c->len) memmove(c->buf, c->buf + off, c->len - off);
+                            c->len -= off;
+                        }
+                    }
+                    // After RDB drain, process any subsequent RESP arrays as commands
+                    if (!srv->repl_expect_rdb)
+                    {
+                        (void)process_conn(fd, &conns[fd], &srv->db);
                     }
                 }
                 continue;
