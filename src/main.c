@@ -91,6 +91,8 @@ int main(int argc, char **argv)
     srv.replica_fds = NULL;
     srv.nreplicas = 0;
     srv.replicas_cap = 0;
+    srv.repl_expect_rdb = 0;
+    srv.repl_rdb_remaining = 0;
     if (is_replica)
     {
         // Connect to master and send initial PING
