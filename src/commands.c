@@ -2,6 +2,13 @@
 #include "server.h"
 
 static Server *g_srv = NULL;
+// Suppress replies on the replica's replication link
+int resp_should_send(int fd)
+{
+    if (g_srv && g_srv->is_replica && g_srv->repl_fd >= 0 && fd == g_srv->repl_fd)
+        return 0;
+    return 1;
+}
 // Empty RDB payload for full resync (pre-encoded binary from spec)
 static const unsigned char kEmptyRDB[] = {
     0x52,0x45,0x44,0x49,0x53,0x30,0x30,0x31,0x31,0xFA,0x09,0x72,0x65,0x64,0x69,0x73,

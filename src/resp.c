@@ -57,6 +57,7 @@ int ascii_casecmp_n(const char *a, const char *b, size_t n)
 
 int reply_simple(int fd, const char *s)
 {
+    if (!resp_should_send(fd)) return 0;
     char h[256];
     int l = snprintf(h, sizeof(h), "+%s\r\n", s ? s : "");
     if (l <= 0 || (size_t)l >= sizeof(h)) return -1;
@@ -65,6 +66,7 @@ int reply_simple(int fd, const char *s)
 
 int reply_error(int fd, const char *s)
 {
+    if (!resp_should_send(fd)) return 0;
     char h[256];
     int l = snprintf(h, sizeof(h), "-%s\r\n", s ? s : "ERR");
     if (l <= 0 || (size_t)l >= sizeof(h)) return -1;
@@ -73,6 +75,7 @@ int reply_error(int fd, const char *s)
 
 int reply_int(int fd, long long n)
 {
+    if (!resp_should_send(fd)) return 0;
     char h[64];
     int l = snprintf(h, sizeof(h), ":%lld\r\n", n);
     if (l <= 0 || (size_t)l >= sizeof(h)) return -1;
@@ -81,6 +84,7 @@ int reply_int(int fd, long long n)
 
 int reply_bulk(int fd, const char *data, size_t len)
 {
+    if (!resp_should_send(fd)) return 0;
     char h[64];
     int l = snprintf(h, sizeof(h), "$%zu\r\n", len);
     if (l <= 0 || (size_t)l >= sizeof(h)) return -1;
@@ -92,18 +96,21 @@ int reply_bulk(int fd, const char *data, size_t len)
 
 int reply_bulk_cstr(int fd, const char *s)
 {
+    if (!resp_should_send(fd)) return 0;
     size_t len = s ? strlen(s) : 0;
     return reply_bulk(fd, s ? s : "", len);
 }
 
 int reply_null_bulk(int fd)
 {
+    if (!resp_should_send(fd)) return 0;
     static const char nb[] = "$-1\r\n";
     return send_all(fd, nb, sizeof(nb) - 1);
 }
 
 int reply_array_header(int fd, size_t count)
 {
+    if (!resp_should_send(fd)) return 0;
     char h[64];
     int l = snprintf(h, sizeof(h), "*%zu\r\n", count);
     if (l <= 0 || (size_t)l >= sizeof(h)) return -1;
@@ -112,6 +119,7 @@ int reply_array_header(int fd, size_t count)
 
 int reply_null_array(int fd)
 {
+    if (!resp_should_send(fd)) return 0;
     static const char na[] = "*-1\r\n";
     return send_all(fd, na, sizeof(na) - 1);
 }
